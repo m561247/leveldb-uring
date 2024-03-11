@@ -27,6 +27,8 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <liburing.h>
+
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
@@ -58,6 +60,10 @@ constexpr const int kOpenBaseFlags = 0;
 #endif  // defined(HAVE_O_CLOEXEC)
 
 constexpr const size_t kWritableFileBufferSize = 65536;
+
+// io_uring
+const unsigned int kIoUringDepth = 256;
+struct io_uring ring;
 
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {

@@ -46,12 +46,12 @@
 //      heapprofile -- Dump a heap profile (if supported by this port)
 static const char* FLAGS_benchmarks =
     "fillseq,"
-    // "fillsync,"
-    // "fillrandom,"
+    "fillsync,"
+    "fillrandom,"
     // "overwrite,"
     // "readrandom,"
-    // "readrandom,"  // Extra run to allow previous compactions to quiesce
-    // "readseq,"
+    "readrandom,"  // Extra run to allow previous compactions to quiesce
+    "readseq,"
     // "readreverse,"
     // "compact,"
     // "readrandom,"
@@ -66,13 +66,13 @@ static const char* FLAGS_benchmarks =
     ;
 
 // Number of key/values to place in database
-static int FLAGS_num = 1;
+static int FLAGS_num = 1000000;
 
 // Number of read operations to do.  If negative, do FLAGS_num reads.
 static int FLAGS_reads = -1;
 
 // Number of concurrent threads to run.
-static int FLAGS_threads = 1;
+static int FLAGS_threads = 4;
 
 // Size of each value
 static int FLAGS_value_size = 100;
@@ -1135,6 +1135,6 @@ int main(int argc, char** argv) {
 
   leveldb::Benchmark benchmark;
   benchmark.Run();
-  
+  printf("db_bench finish!\n");
   return 0;
 }
