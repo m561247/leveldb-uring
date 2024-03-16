@@ -8,11 +8,6 @@
 #ifndef __Fuchsia__
 #include <sys/resource.h>
 #endif
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -20,25 +15,30 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <liburing.h>
 #include <limits>
 #include <queue>
 #include <set>
 #include <string>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
-#include <liburing.h>
-
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
-#include <iostream>
-
+#define IO_URING 1
+#define QUEUE_DEPTH 128
 namespace leveldb {
 
 namespace {
@@ -62,8 +62,6 @@ constexpr const int kOpenBaseFlags = 0;
 constexpr const size_t kWritableFileBufferSize = 65536;
 
 // io_uring
-const unsigned int kIoUringDepth = 256;
-struct io_uring ring;
 
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
@@ -196,7 +194,6 @@ class PosixRandomAccessFile final : public RandomAccessFile {
   }
 
   ~PosixRandomAccessFile() override {
-
     if (has_permanent_fd_) {
       assert(fd_ != -1);
       ::close(fd_);
@@ -289,13 +286,20 @@ class PosixWritableFile final : public WritableFile {
         fd_(fd),
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
-        dirname_(Dirname(filename_)) {}
+        dirname_(Dirname(filename_)) {
+    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+      // Handle initialization failure
+      // You might want to throw an exception or set an error flag
+      printf("Failed to initialize io_uring");
+    }
+  }
 
   ~PosixWritableFile() override {
     if (fd_ >= 0) {
       // Ignoring any potential errors
       Close();
     }
+    io_uring_queue_exit(&ring);
   }
 
   Status Append(const Slice& data) override {
@@ -328,7 +332,7 @@ class PosixWritableFile final : public WritableFile {
   }
 
   Status Close() override {
-	  Status status = FlushBuffer();
+    Status status = FlushBuffer();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -416,13 +420,46 @@ class PosixWritableFile final : public WritableFile {
 #if HAVE_FDATASYNC
     bool sync_success = ::fdatasync(fd) == 0;
 #else
-    bool sync_success = ::fsync(fd) == 0;
-#endif  // HAVE_FDATASYNC
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
 
-    if (sync_success) {
-      return Status::OK();
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      fprintf(stderr, "io_uring_get_sqe failed\n");
+      close(fd);
+      io_uring_queue_exit(&ring);
+      exit(EXIT_FAILURE);
     }
-    return PosixError(fd_path, errno);
+    io_uring_prep_fsync(sqe, fd, 0);
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+      fprintf(stderr, "io_uring_submit failed\n");
+      close(fd);
+      io_uring_queue_exit(&ring);
+      exit(EXIT_FAILURE);
+    }
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+      fprintf(stderr, "io_uring_wait_cqe failed\n");
+      close(fd);
+      io_uring_queue_exit(&ring);
+      exit(EXIT_FAILURE);
+    }
+    if (cqe->res < 0) {
+      fprintf(stderr, "Async fsync failed: %s\n", strerror(-cqe->res));
+    } else {
+      printf("Data successfully synced to disk")
+    }
+    // bool sync_success = ::fsync(fd) == 0;
+    io_uring_cqe_seen(&ring, cqe);
+    close(fd);
+    io_uring_queue_exit(&ring);
+#endif  // HAVE_FDATASYNC
+    printf("---------------------uring fsync---------------------\n");
+    // if (sync_success) {
+      return Status::OK();
+    // }
+    // return PosixError(fd_path, errno);
   }
 
   // Returns the directory name in a path pointing to a file.
@@ -470,6 +507,8 @@ class PosixWritableFile final : public WritableFile {
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
+
+  struct io_uring ring;
 };
 
 int LockOrUnlock(int fd, bool lock) {

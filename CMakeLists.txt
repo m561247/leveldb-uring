@@ -267,7 +267,8 @@ if(HAVE_CLANG_THREAD_SAFETY)
     PUBLIC
       -Werror -Wthread-safety)
 endif(HAVE_CLANG_THREAD_SAFETY)
-
+# io_uring
+target_link_libraries(leveldb uring)
 if(HAVE_CRC32C)
   target_link_libraries(leveldb crc32c)
 endif(HAVE_CRC32C)
