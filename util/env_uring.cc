@@ -39,6 +39,7 @@
 #include "util/posix_logger.h"
 #define IO_URING 1
 #define QUEUE_DEPTH 128
+#define HAVE_FDATASYNC 0
 namespace leveldb {
 
 namespace {
@@ -359,7 +360,7 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
 
-    return SyncFd(fd_, filename_);
+    return SyncFd(fd_, filename_, ring);
   }
 
  private:
@@ -369,488 +370,482 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-  Status WriteUnbuffered(const char* data, size_t size) {
-    while (size > 0) {
-      ssize_t write_result = ::write(fd_, data, size);
-      if (write_result < 0) {
-        if (errno == EINTR) {
-          continue;  // Retry
-        }
-        return PosixError(filename_, errno);
-      }
-      data += write_result;
-      size -= write_result;
-    }
-    return Status::OK();
-  }
+     Status WriteUnbuffered(const char* data, size_t size) {
+        struct io_uring_sqe* sqe;
+        struct io_uring_cqe* cqe;
+        int ret;
 
-  Status SyncDirIfManifest() {
-    Status status;
-    if (!is_manifest_) {
+        while (size > 0) {
+            sqe = io_uring_get_sqe(&ring);
+            if (!sqe) {
+                // Handle error
+                return PosixError(filename_, -sqe->fd);
+            }
+
+            io_uring_prep_write(sqe, fd_, data, size, 0);
+            sqe->flags |= IOSQE_FIXED_FILE;
+
+            ret = io_uring_submit(&ring);
+            if (ret < 0) {
+                // Handle error
+                return PosixError(filename_, -cqe->res);
+            }
+
+            ret = io_uring_wait_cqe(&ring, &cqe);
+            if (ret < 0) {
+                // Handle error
+                return PosixError(filename_, -cqe->res);
+            }
+
+            if (cqe->res < 0) {
+                // Handle error, for example, if res is -EINTR, you may want to retry
+                io_uring_cqe_seen(&ring, cqe);
+                return PosixError(filename_, -cqe->res);
+            }
+
+            data += cqe->res;
+            size -= cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+        }
+
+        return Status::OK();
+    }
+    Status SyncDirIfManifest() {
+      Status status;
+      if (!is_manifest_) {
+        return status;
+      }
+
+      int fd = ::open(dirname_.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) {
+        status = PosixError(dirname_, errno);
+      } else {
+        status = SyncFd(fd, dirname_, ring);
+        ::close(fd);
+      }
       return status;
     }
 
-    int fd = ::open(dirname_.c_str(), O_RDONLY | kOpenBaseFlags);
-    if (fd < 0) {
-      status = PosixError(dirname_, errno);
-    } else {
-      status = SyncFd(fd, dirname_);
-      ::close(fd);
-    }
-    return status;
-  }
-
-  // Ensures that all the caches associated with the given file descriptor's
-  // data are flushed all the way to durable media, and can withstand power
-  // failures.
-  //
-  // The path argument is only used to populate the description string in the
-  // returned Status if an error occurs.
-  static Status SyncFd(int fd, const std::string& fd_path) {
+    // Ensures that all the caches associated with the given file descriptor's
+    // data are flushed all the way to durable media, and can withstand power
+    // failures.
+    //
+    // The path argument is only used to populate the description string in the
+    // returned Status if an error occurs.
+    static Status SyncFd(int fd, const std::string& fd_path,
+                         struct io_uring ring) {
 #if HAVE_FULLFSYNC
-    // On macOS and iOS, fsync() doesn't guarantee durability past power
-    // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
-    // filesystems don't support fcntl(F_FULLFSYNC), and require a fallback to
-    // fsync().
-    if (::fcntl(fd, F_FULLFSYNC) == 0) {
-      return Status::OK();
-    }
+      // On macOS and iOS, fsync() doesn't guarantee durability past power
+      // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
+      // filesystems don't support fcntl(F_FULLFSYNC), and require a fallback to
+      // fsync().
+      if (::fcntl(fd, F_FULLFSYNC) == 0) {
+        return Status::OK();
+      }
 #endif  // HAVE_FULLFSYNC
 
 #if HAVE_FDATASYNC
-    bool sync_success = ::fdatasync(fd) == 0;
+      bool sync_success = ::fdatasync(fd) == 0;
 #else
-    struct io_uring_sqe* sqe;
-    struct io_uring_cqe* cqe;
-
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-      fprintf(stderr, "io_uring_get_sqe failed\n");
-      close(fd);
-      io_uring_queue_exit(&ring);
-      exit(EXIT_FAILURE);
-    }
-    io_uring_prep_fsync(sqe, fd, 0);
-    int ret = io_uring_submit(&ring);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_submit failed\n");
-      close(fd);
-      io_uring_queue_exit(&ring);
-      exit(EXIT_FAILURE);
-    }
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_wait_cqe failed\n");
-      close(fd);
-      io_uring_queue_exit(&ring);
-      exit(EXIT_FAILURE);
-    }
-    if (cqe->res < 0) {
-      fprintf(stderr, "Async fsync failed: %s\n", strerror(-cqe->res));
-    } else {
-      printf("Data successfully synced to disk")
-    }
-    // bool sync_success = ::fsync(fd) == 0;
-    io_uring_cqe_seen(&ring, cqe);
-    close(fd);
-    io_uring_queue_exit(&ring);
+      bool sync_success = ::fsync(fd) == 0;
 #endif  // HAVE_FDATASYNC
-    printf("---------------------uring fsync---------------------\n");
-    // if (sync_success) {
-      return Status::OK();
-    // }
-    // return PosixError(fd_path, errno);
-  }
-
-  // Returns the directory name in a path pointing to a file.
-  //
-  // Returns "." if the path does not contain any directory separator.
-  static std::string Dirname(const std::string& filename) {
-    std::string::size_type separator_pos = filename.rfind('/');
-    if (separator_pos == std::string::npos) {
-      return std::string(".");
-    }
-    // The filename component should not contain a path separator. If it does,
-    // the splitting was done incorrectly.
-    assert(filename.find('/', separator_pos + 1) == std::string::npos);
-
-    return filename.substr(0, separator_pos);
-  }
-
-  // Extracts the file name from a path pointing to a file.
-  //
-  // The returned Slice points to |filename|'s data buffer, so it is only valid
-  // while |filename| is alive and unchanged.
-  static Slice Basename(const std::string& filename) {
-    std::string::size_type separator_pos = filename.rfind('/');
-    if (separator_pos == std::string::npos) {
-      return Slice(filename);
-    }
-    // The filename component should not contain a path separator. If it does,
-    // the splitting was done incorrectly.
-    assert(filename.find('/', separator_pos + 1) == std::string::npos);
-
-    return Slice(filename.data() + separator_pos + 1,
-                 filename.length() - separator_pos - 1);
-  }
-
-  // True if the given file is a manifest file.
-  static bool IsManifest(const std::string& filename) {
-    return Basename(filename).starts_with("MANIFEST");
-  }
-
-  // buf_[0, pos_ - 1] contains data to be written to fd_.
-  char buf_[kWritableFileBufferSize];
-  size_t pos_;
-  int fd_;
-
-  const bool is_manifest_;  // True if the file's name starts with MANIFEST.
-  const std::string filename_;
-  const std::string dirname_;  // The directory of filename_.
-
-  struct io_uring ring;
-};
-
-int LockOrUnlock(int fd, bool lock) {
-  errno = 0;
-  struct ::flock file_lock_info;
-  std::memset(&file_lock_info, 0, sizeof(file_lock_info));
-  file_lock_info.l_type = (lock ? F_WRLCK : F_UNLCK);
-  file_lock_info.l_whence = SEEK_SET;
-  file_lock_info.l_start = 0;
-  file_lock_info.l_len = 0;  // Lock/unlock entire file.
-  return ::fcntl(fd, F_SETLK, &file_lock_info);
-}
-
-// Instances are thread-safe because they are immutable.
-class PosixFileLock : public FileLock {
- public:
-  PosixFileLock(int fd, std::string filename)
-      : fd_(fd), filename_(std::move(filename)) {}
-
-  int fd() const { return fd_; }
-  const std::string& filename() const { return filename_; }
-
- private:
-  const int fd_;
-  const std::string filename_;
-};
-
-// Tracks the files locked by PosixEnv::LockFile().
-//
-// We maintain a separate set instead of relying on fcntl(F_SETLK) because
-// fcntl(F_SETLK) does not provide any protection against multiple uses from the
-// same process.
-//
-// Instances are thread-safe because all member data is guarded by a mutex.
-class PosixLockTable {
- public:
-  bool Insert(const std::string& fname) LOCKS_EXCLUDED(mu_) {
-    mu_.Lock();
-    bool succeeded = locked_files_.insert(fname).second;
-    mu_.Unlock();
-    return succeeded;
-  }
-  void Remove(const std::string& fname) LOCKS_EXCLUDED(mu_) {
-    mu_.Lock();
-    locked_files_.erase(fname);
-    mu_.Unlock();
-  }
-
- private:
-  port::Mutex mu_;
-  std::set<std::string> locked_files_ GUARDED_BY(mu_);
-};
-
-class PosixEnv : public Env {
- public:
-  PosixEnv();
-  ~PosixEnv() override {
-    static const char msg[] =
-        "PosixEnv singleton destroyed. Unsupported behavior!\n";
-    std::fwrite(msg, 1, sizeof(msg), stderr);
-    std::abort();
-  }
-
-  Status NewSequentialFile(const std::string& filename,
-                           SequentialFile** result) override {
-    int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
-    if (fd < 0) {
-      *result = nullptr;
-      return PosixError(filename, errno);
-    }
-
-    *result = new PosixSequentialFile(filename, fd);
-    return Status::OK();
-  }
-
-  Status NewRandomAccessFile(const std::string& filename,
-                             RandomAccessFile** result) override {
-    *result = nullptr;
-    int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
-    if (fd < 0) {
-      return PosixError(filename, errno);
-    }
-
-    if (!mmap_limiter_.Acquire()) {
-      *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
-      return Status::OK();
-    }
-
-    uint64_t file_size;
-    Status status = GetFileSize(filename, &file_size);
-    if (status.ok()) {
-      void* mmap_base =
-          ::mmap(/*addr=*/nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-      if (mmap_base != MAP_FAILED) {
-        *result = new PosixMmapReadableFile(filename,
-                                            reinterpret_cast<char*>(mmap_base),
-                                            file_size, &mmap_limiter_);
-      } else {
-        status = PosixError(filename, errno);
+      if (sync_success) {
+        return Status::OK();
       }
-    }
-    ::close(fd);
-    if (!status.ok()) {
-      mmap_limiter_.Release();
-    }
-    return status;
-  }
-
-  Status NewWritableFile(const std::string& filename,
-                         WritableFile** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_TRUNC | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
-    if (fd < 0) {
-      *result = nullptr;
-      return PosixError(filename, errno);
+      return PosixError(fd_path, errno);
     }
 
-    *result = new PosixWritableFile(filename, fd);
-    return Status::OK();
-  }
+    // Returns the directory name in a path pointing to a file.
+    //
+    // Returns "." if the path does not contain any directory separator.
+    static std::string Dirname(const std::string& filename) {
+      std::string::size_type separator_pos = filename.rfind('/');
+      if (separator_pos == std::string::npos) {
+        return std::string(".");
+      }
+      // The filename component should not contain a path separator. If it does,
+      // the splitting was done incorrectly.
+      assert(filename.find('/', separator_pos + 1) == std::string::npos);
 
-  Status NewAppendableFile(const std::string& filename,
-                           WritableFile** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_APPEND | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
-    if (fd < 0) {
-      *result = nullptr;
-      return PosixError(filename, errno);
+      return filename.substr(0, separator_pos);
     }
 
-    *result = new PosixWritableFile(filename, fd);
-    return Status::OK();
-  }
+    // Extracts the file name from a path pointing to a file.
+    //
+    // The returned Slice points to |filename|'s data buffer, so it is only
+    // valid while |filename| is alive and unchanged.
+    static Slice Basename(const std::string& filename) {
+      std::string::size_type separator_pos = filename.rfind('/');
+      if (separator_pos == std::string::npos) {
+        return Slice(filename);
+      }
+      // The filename component should not contain a path separator. If it does,
+      // the splitting was done incorrectly.
+      assert(filename.find('/', separator_pos + 1) == std::string::npos);
 
-  bool FileExists(const std::string& filename) override {
-    return ::access(filename.c_str(), F_OK) == 0;
-  }
-
-  Status GetChildren(const std::string& directory_path,
-                     std::vector<std::string>* result) override {
-    result->clear();
-    ::DIR* dir = ::opendir(directory_path.c_str());
-    if (dir == nullptr) {
-      return PosixError(directory_path, errno);
-    }
-    struct ::dirent* entry;
-    while ((entry = ::readdir(dir)) != nullptr) {
-      result->emplace_back(entry->d_name);
-    }
-    ::closedir(dir);
-    return Status::OK();
-  }
-
-  Status RemoveFile(const std::string& filename) override {
-    if (::unlink(filename.c_str()) != 0) {
-      return PosixError(filename, errno);
-    }
-    return Status::OK();
-  }
-
-  Status CreateDir(const std::string& dirname) override {
-    std::cout << dirname.c_str() << std::endl;
-    if (::mkdir(dirname.c_str(), 0755) != 0) {
-      return PosixError(dirname, errno);
-    }
-    return Status::OK();
-  }
-
-  Status RemoveDir(const std::string& dirname) override {
-    if (::rmdir(dirname.c_str()) != 0) {
-      return PosixError(dirname, errno);
-    }
-    return Status::OK();
-  }
-
-  Status GetFileSize(const std::string& filename, uint64_t* size) override {
-    struct ::stat file_stat;
-    if (::stat(filename.c_str(), &file_stat) != 0) {
-      *size = 0;
-      return PosixError(filename, errno);
-    }
-    *size = file_stat.st_size;
-    return Status::OK();
-  }
-
-  Status RenameFile(const std::string& from, const std::string& to) override {
-    std::cout << to.c_str() << std::endl;
-    if (std::rename(from.c_str(), to.c_str()) != 0) {
-      return PosixError(from, errno);
-    }
-    return Status::OK();
-  }
-
-  Status LockFile(const std::string& filename, FileLock** lock) override {
-    *lock = nullptr;
-
-    int fd = ::open(filename.c_str(), O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
-    if (fd < 0) {
-      return PosixError(filename, errno);
+      return Slice(filename.data() + separator_pos + 1,
+                   filename.length() - separator_pos - 1);
     }
 
-    if (!locks_.Insert(filename)) {
-      ::close(fd);
-      return Status::IOError("lock " + filename, "already held by process");
+    // True if the given file is a manifest file.
+    static bool IsManifest(const std::string& filename) {
+      return Basename(filename).starts_with("MANIFEST");
     }
 
-    if (LockOrUnlock(fd, true) == -1) {
-      int lock_errno = errno;
-      ::close(fd);
-      locks_.Remove(filename);
-      return PosixError("lock " + filename, lock_errno);
-    }
+    // buf_[0, pos_ - 1] contains data to be written to fd_.
+    char buf_[kWritableFileBufferSize];
+    size_t pos_;
+    int fd_;
 
-    *lock = new PosixFileLock(fd, filename);
-    return Status::OK();
-  }
+    const bool is_manifest_;  // True if the file's name starts with MANIFEST.
+    const std::string filename_;
+    const std::string dirname_;  // The directory of filename_.
 
-  Status UnlockFile(FileLock* lock) override {
-    PosixFileLock* posix_file_lock = static_cast<PosixFileLock*>(lock);
-    if (LockOrUnlock(posix_file_lock->fd(), false) == -1) {
-      return PosixError("unlock " + posix_file_lock->filename(), errno);
-    }
-    locks_.Remove(posix_file_lock->filename());
-    ::close(posix_file_lock->fd());
-    delete posix_file_lock;
-    return Status::OK();
-  }
-
-  void Schedule(void (*background_work_function)(void* background_work_arg),
-                void* background_work_arg) override;
-
-  void StartThread(void (*thread_main)(void* thread_main_arg),
-                   void* thread_main_arg) override {
-    std::thread new_thread(thread_main, thread_main_arg);
-    new_thread.detach();
-  }
-
-  Status GetTestDirectory(std::string* result) override {
-    const char* env = std::getenv("TEST_TMPDIR");
-    if (env && env[0] != '\0') {
-      *result = env;
-    } else {
-      char buf[100];
-      std::snprintf(buf, sizeof(buf), "/tmp/leveldbtest-%d",
-                    static_cast<int>(::geteuid()));
-      *result = buf;
-    }
-
-    // The CreateDir status is ignored because the directory may already exist.
-    CreateDir(*result);
-
-    return Status::OK();
-  }
-
-  Status NewLogger(const std::string& filename, Logger** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_APPEND | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
-    if (fd < 0) {
-      *result = nullptr;
-      return PosixError(filename, errno);
-    }
-
-    std::FILE* fp = ::fdopen(fd, "w");
-    if (fp == nullptr) {
-      ::close(fd);
-      *result = nullptr;
-      return PosixError(filename, errno);
-    } else {
-      *result = new PosixLogger(fp);
-      return Status::OK();
-    }
-  }
-
-  uint64_t NowMicros() override {
-    static constexpr uint64_t kUsecondsPerSecond = 1000000;
-    struct ::timeval tv;
-    ::gettimeofday(&tv, nullptr);
-    return static_cast<uint64_t>(tv.tv_sec) * kUsecondsPerSecond + tv.tv_usec;
-  }
-
-  void SleepForMicroseconds(int micros) override {
-    std::this_thread::sleep_for(std::chrono::microseconds(micros));
-  }
-
- private:
-  void BackgroundThreadMain();
-
-  static void BackgroundThreadEntryPoint(PosixEnv* env) {
-    env->BackgroundThreadMain();
-  }
-
-  // Stores the work item data in a Schedule() call.
-  //
-  // Instances are constructed on the thread calling Schedule() and used on the
-  // background thread.
-  //
-  // This structure is thread-safe because it is immutable.
-  struct BackgroundWorkItem {
-    explicit BackgroundWorkItem(void (*function)(void* arg), void* arg)
-        : function(function), arg(arg) {}
-
-    void (*const function)(void*);
-    void* const arg;
+    struct io_uring ring;
   };
 
-  port::Mutex background_work_mutex_;
-  port::CondVar background_work_cv_ GUARDED_BY(background_work_mutex_);
-  bool started_background_thread_ GUARDED_BY(background_work_mutex_);
+  int LockOrUnlock(int fd, bool lock) {
+    errno = 0;
+    struct ::flock file_lock_info;
+    std::memset(&file_lock_info, 0, sizeof(file_lock_info));
+    file_lock_info.l_type = (lock ? F_WRLCK : F_UNLCK);
+    file_lock_info.l_whence = SEEK_SET;
+    file_lock_info.l_start = 0;
+    file_lock_info.l_len = 0;  // Lock/unlock entire file.
+    return ::fcntl(fd, F_SETLK, &file_lock_info);
+  }
 
-  std::queue<BackgroundWorkItem> background_work_queue_
-      GUARDED_BY(background_work_mutex_);
+  // Instances are thread-safe because they are immutable.
+  class PosixFileLock : public FileLock {
+   public:
+    PosixFileLock(int fd, std::string filename)
+        : fd_(fd), filename_(std::move(filename)) {}
 
-  PosixLockTable locks_;  // Thread-safe.
-  Limiter mmap_limiter_;  // Thread-safe.
-  Limiter fd_limiter_;    // Thread-safe.
-};
+    int fd() const { return fd_; }
+    const std::string& filename() const { return filename_; }
 
-// Return the maximum number of concurrent mmaps.
-int MaxMmaps() { return g_mmap_limit; }
+   private:
+    const int fd_;
+    const std::string filename_;
+  };
 
-// Return the maximum number of read-only files to keep open.
-int MaxOpenFiles() {
-  if (g_open_read_only_file_limit >= 0) {
+  // Tracks the files locked by PosixEnv::LockFile().
+  //
+  // We maintain a separate set instead of relying on fcntl(F_SETLK) because
+  // fcntl(F_SETLK) does not provide any protection against multiple uses from
+  // the same process.
+  //
+  // Instances are thread-safe because all member data is guarded by a mutex.
+  class PosixLockTable {
+   public:
+    bool Insert(const std::string& fname) LOCKS_EXCLUDED(mu_) {
+      mu_.Lock();
+      bool succeeded = locked_files_.insert(fname).second;
+      mu_.Unlock();
+      return succeeded;
+    }
+    void Remove(const std::string& fname) LOCKS_EXCLUDED(mu_) {
+      mu_.Lock();
+      locked_files_.erase(fname);
+      mu_.Unlock();
+    }
+
+   private:
+    port::Mutex mu_;
+    std::set<std::string> locked_files_ GUARDED_BY(mu_);
+  };
+
+  class PosixEnv : public Env {
+   public:
+    PosixEnv();
+    ~PosixEnv() override {
+      static const char msg[] =
+          "PosixEnv singleton destroyed. Unsupported behavior!\n";
+      std::fwrite(msg, 1, sizeof(msg), stderr);
+      std::abort();
+    }
+
+    Status NewSequentialFile(const std::string& filename,
+                             SequentialFile** result) override {
+      int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) {
+        *result = nullptr;
+        return PosixError(filename, errno);
+      }
+
+      *result = new PosixSequentialFile(filename, fd);
+      return Status::OK();
+    }
+
+    Status NewRandomAccessFile(const std::string& filename,
+                               RandomAccessFile** result) override {
+      *result = nullptr;
+      int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) {
+        return PosixError(filename, errno);
+      }
+
+      if (!mmap_limiter_.Acquire()) {
+        *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
+        return Status::OK();
+      }
+
+      uint64_t file_size;
+      Status status = GetFileSize(filename, &file_size);
+      if (status.ok()) {
+        void* mmap_base =
+            ::mmap(/*addr=*/nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (mmap_base != MAP_FAILED) {
+          *result = new PosixMmapReadableFile(
+              filename, reinterpret_cast<char*>(mmap_base), file_size,
+              &mmap_limiter_);
+        } else {
+          status = PosixError(filename, errno);
+        }
+      }
+      ::close(fd);
+      if (!status.ok()) {
+        mmap_limiter_.Release();
+      }
+      return status;
+    }
+
+    Status NewWritableFile(const std::string& filename,
+                           WritableFile** result) override {
+      int fd = ::open(filename.c_str(),
+                      O_TRUNC | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
+      if (fd < 0) {
+        *result = nullptr;
+        return PosixError(filename, errno);
+      }
+
+      *result = new PosixWritableFile(filename, fd);
+      return Status::OK();
+    }
+
+    Status NewAppendableFile(const std::string& filename,
+                             WritableFile** result) override {
+      int fd = ::open(filename.c_str(),
+                      O_APPEND | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
+      if (fd < 0) {
+        *result = nullptr;
+        return PosixError(filename, errno);
+      }
+
+      *result = new PosixWritableFile(filename, fd);
+      return Status::OK();
+    }
+
+    bool FileExists(const std::string& filename) override {
+      return ::access(filename.c_str(), F_OK) == 0;
+    }
+
+    Status GetChildren(const std::string& directory_path,
+                       std::vector<std::string>* result) override {
+      result->clear();
+      ::DIR* dir = ::opendir(directory_path.c_str());
+      if (dir == nullptr) {
+        return PosixError(directory_path, errno);
+      }
+      struct ::dirent* entry;
+      while ((entry = ::readdir(dir)) != nullptr) {
+        result->emplace_back(entry->d_name);
+      }
+      ::closedir(dir);
+      return Status::OK();
+    }
+
+    Status RemoveFile(const std::string& filename) override {
+      if (::unlink(filename.c_str()) != 0) {
+        return PosixError(filename, errno);
+      }
+      return Status::OK();
+    }
+
+    Status CreateDir(const std::string& dirname) override {
+      std::cout << dirname.c_str() << std::endl;
+      if (::mkdir(dirname.c_str(), 0755) != 0) {
+        return PosixError(dirname, errno);
+      }
+      return Status::OK();
+    }
+
+    Status RemoveDir(const std::string& dirname) override {
+      if (::rmdir(dirname.c_str()) != 0) {
+        return PosixError(dirname, errno);
+      }
+      return Status::OK();
+    }
+
+    Status GetFileSize(const std::string& filename, uint64_t* size) override {
+      struct ::stat file_stat;
+      if (::stat(filename.c_str(), &file_stat) != 0) {
+        *size = 0;
+        return PosixError(filename, errno);
+      }
+      *size = file_stat.st_size;
+      return Status::OK();
+    }
+
+    Status RenameFile(const std::string& from, const std::string& to) override {
+      std::cout << to.c_str() << std::endl;
+      if (std::rename(from.c_str(), to.c_str()) != 0) {
+        return PosixError(from, errno);
+      }
+      return Status::OK();
+    }
+
+    Status LockFile(const std::string& filename, FileLock** lock) override {
+      *lock = nullptr;
+
+      int fd =
+          ::open(filename.c_str(), O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
+      if (fd < 0) {
+        return PosixError(filename, errno);
+      }
+
+      if (!locks_.Insert(filename)) {
+        ::close(fd);
+        return Status::IOError("lock " + filename, "already held by process");
+      }
+
+      if (LockOrUnlock(fd, true) == -1) {
+        int lock_errno = errno;
+        ::close(fd);
+        locks_.Remove(filename);
+        return PosixError("lock " + filename, lock_errno);
+      }
+
+      *lock = new PosixFileLock(fd, filename);
+      return Status::OK();
+    }
+
+    Status UnlockFile(FileLock* lock) override {
+      PosixFileLock* posix_file_lock = static_cast<PosixFileLock*>(lock);
+      if (LockOrUnlock(posix_file_lock->fd(), false) == -1) {
+        return PosixError("unlock " + posix_file_lock->filename(), errno);
+      }
+      locks_.Remove(posix_file_lock->filename());
+      ::close(posix_file_lock->fd());
+      delete posix_file_lock;
+      return Status::OK();
+    }
+
+    void Schedule(void (*background_work_function)(void* background_work_arg),
+                  void* background_work_arg) override;
+
+    void StartThread(void (*thread_main)(void* thread_main_arg),
+                     void* thread_main_arg) override {
+      std::thread new_thread(thread_main, thread_main_arg);
+      new_thread.detach();
+    }
+
+    Status GetTestDirectory(std::string* result) override {
+      const char* env = std::getenv("TEST_TMPDIR");
+      if (env && env[0] != '\0') {
+        *result = env;
+      } else {
+        char buf[100];
+        std::snprintf(buf, sizeof(buf), "/tmp/leveldbtest-%d",
+                      static_cast<int>(::geteuid()));
+        *result = buf;
+      }
+
+      // The CreateDir status is ignored because the directory may already
+      // exist.
+      CreateDir(*result);
+
+      return Status::OK();
+    }
+
+    Status NewLogger(const std::string& filename, Logger** result) override {
+      int fd = ::open(filename.c_str(),
+                      O_APPEND | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
+      if (fd < 0) {
+        *result = nullptr;
+        return PosixError(filename, errno);
+      }
+
+      std::FILE* fp = ::fdopen(fd, "w");
+      if (fp == nullptr) {
+        ::close(fd);
+        *result = nullptr;
+        return PosixError(filename, errno);
+      } else {
+        *result = new PosixLogger(fp);
+        return Status::OK();
+      }
+    }
+
+    uint64_t NowMicros() override {
+      static constexpr uint64_t kUsecondsPerSecond = 1000000;
+      struct ::timeval tv;
+      ::gettimeofday(&tv, nullptr);
+      return static_cast<uint64_t>(tv.tv_sec) * kUsecondsPerSecond + tv.tv_usec;
+    }
+
+    void SleepForMicroseconds(int micros) override {
+      std::this_thread::sleep_for(std::chrono::microseconds(micros));
+    }
+
+   private:
+    void BackgroundThreadMain();
+
+    static void BackgroundThreadEntryPoint(PosixEnv* env) {
+      env->BackgroundThreadMain();
+    }
+
+    // Stores the work item data in a Schedule() call.
+    //
+    // Instances are constructed on the thread calling Schedule() and used on
+    // the background thread.
+    //
+    // This structure is thread-safe because it is immutable.
+    struct BackgroundWorkItem {
+      explicit BackgroundWorkItem(void (*function)(void* arg), void* arg)
+          : function(function), arg(arg) {}
+
+      void (*const function)(void*);
+      void* const arg;
+    };
+
+    port::Mutex background_work_mutex_;
+    port::CondVar background_work_cv_ GUARDED_BY(background_work_mutex_);
+    bool started_background_thread_ GUARDED_BY(background_work_mutex_);
+
+    std::queue<BackgroundWorkItem> background_work_queue_
+        GUARDED_BY(background_work_mutex_);
+
+    PosixLockTable locks_;  // Thread-safe.
+    Limiter mmap_limiter_;  // Thread-safe.
+    Limiter fd_limiter_;    // Thread-safe.
+  };
+
+  // Return the maximum number of concurrent mmaps.
+  int MaxMmaps() { return g_mmap_limit; }
+
+  // Return the maximum number of read-only files to keep open.
+  int MaxOpenFiles() {
+    if (g_open_read_only_file_limit >= 0) {
+      return g_open_read_only_file_limit;
+    }
+#ifdef __Fuchsia__
+    // Fuchsia doesn't implement getrlimit.
+    g_open_read_only_file_limit = 50;
+#else
+    struct ::rlimit rlim;
+    if (::getrlimit(RLIMIT_NOFILE, &rlim)) {
+      // getrlimit failed, fallback to hard-coded default.
+      g_open_read_only_file_limit = 50;
+    } else if (rlim.rlim_cur == RLIM_INFINITY) {
+      g_open_read_only_file_limit = std::numeric_limits<int>::max();
+    } else {
+      // Allow use of 20% of available file descriptors for read-only files.
+      g_open_read_only_file_limit = rlim.rlim_cur / 5;
+    }
+#endif
     return g_open_read_only_file_limit;
   }
-#ifdef __Fuchsia__
-  // Fuchsia doesn't implement getrlimit.
-  g_open_read_only_file_limit = 50;
-#else
-  struct ::rlimit rlim;
-  if (::getrlimit(RLIMIT_NOFILE, &rlim)) {
-    // getrlimit failed, fallback to hard-coded default.
-    g_open_read_only_file_limit = 50;
-  } else if (rlim.rlim_cur == RLIM_INFINITY) {
-    g_open_read_only_file_limit = std::numeric_limits<int>::max();
-  } else {
-    // Allow use of 20% of available file descriptors for read-only files.
-    g_open_read_only_file_limit = rlim.rlim_cur / 5;
-  }
-#endif
-  return g_open_read_only_file_limit;
-}
 
 }  // namespace
 
@@ -858,7 +853,8 @@ PosixEnv::PosixEnv()
     : background_work_cv_(&background_work_mutex_),
       started_background_thread_(false),
       mmap_limiter_(MaxMmaps()),
-      fd_limiter_(MaxOpenFiles()) {}
+      fd_limiter_(MaxOpenFiles()) {
+}
 
 void PosixEnv::Schedule(
     void (*background_work_function)(void* background_work_arg),
