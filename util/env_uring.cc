@@ -370,44 +370,38 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-     Status WriteUnbuffered(const char* data, size_t size) {
-        struct io_uring_sqe* sqe;
-        struct io_uring_cqe* cqe;
-        int ret;
+   Status WriteUnbuffered(const char* data, size_t size) {
+        struct iovec iov = {
+            .iov_base = (void*)data, // Cast to void* because iovec expects it
+            .iov_len = size
+        };
 
-        while (size > 0) {
-            sqe = io_uring_get_sqe(&ring);
-            if (!sqe) {
-                // Handle error
-                return PosixError(filename_, -sqe->fd);
-            }
-
-            io_uring_prep_write(sqe, fd_, data, size, 0);
-            sqe->flags |= IOSQE_FIXED_FILE;
-
-            ret = io_uring_submit(&ring);
-            if (ret < 0) {
-                // Handle error
-                return PosixError(filename_, -cqe->res);
-            }
-
-            ret = io_uring_wait_cqe(&ring, &cqe);
-            if (ret < 0) {
-                // Handle error
-                return PosixError(filename_, -cqe->res);
-            }
-
-            if (cqe->res < 0) {
-                // Handle error, for example, if res is -EINTR, you may want to retry
-                io_uring_cqe_seen(&ring, cqe);
-                return PosixError(filename_, -cqe->res);
-            }
-
-            data += cqe->res;
-            size -= cqe->res;
-            io_uring_cqe_seen(&ring, cqe);
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            return PosixError("Failed to get SQE", errno);
         }
 
+        io_uring_prep_writev(sqe, fd_, &iov, 1, 0); // Assuming fd_ is your file descriptor
+        int ret = io_uring_submit(&ring);
+        if (ret < 0) {
+            return PosixError("Submit failed", ret);
+        }
+
+        struct io_uring_cqe* cqe;
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            return PosixError("Wait for completion failed", ret);
+        }
+
+        if (cqe->res < 0) {
+            io_uring_cqe_seen(&ring, cqe);
+            return PosixError("Writev operation failed", -cqe->res);
+        }
+
+        io_uring_cqe_seen(&ring, cqe);
+      
+        // Assuming the entire write was successful if no errors occurred.
+        // In practice, you might need to handle partial writes or retries for the unsent portion.
         return Status::OK();
     }
     Status SyncDirIfManifest() {
