@@ -40,6 +40,8 @@
 #define IO_URING 1
 #define QUEUE_DEPTH 128
 #define HAVE_FDATASYNC 0
+#define POSIX 0
+
 namespace leveldb {
 
 namespace {
@@ -368,6 +370,23 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
+#if POSIX
+  Status WriteUnbuffered(const char* data, size_t size) {
+    while (size > 0) {
+      ssize_t write_result = ::write(fd_, data, size);
+      if (write_result < 0) {
+        if (errno == EINTR) {
+          continue;  // Retry
+        }
+        return PosixError(filename_, errno);
+      }
+      data += write_result;
+      size -= write_result;
+    }
+    return Status::OK();
+  }
+#else
+
   Status WriteUnbuffered(const char* data, size_t size) {
     if (size > 0) {
       struct iovec iov = {
@@ -407,6 +426,7 @@ class PosixWritableFile final : public WritableFile {
     }
     return Status::OK();
   }
+#endif
   Status SyncDirIfManifest() {
     Status status;
     if (!is_manifest_) {
@@ -444,45 +464,7 @@ class PosixWritableFile final : public WritableFile {
 #if HAVE_FDATASYNC
     bool sync_success = ::fdatasync(fd) == 0;
 #else
-    int ret;
-    struct io_uring_sqe *sqe;
-    struct io_uring_cqe *cqe;
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-      fprintf(stderr, "Failed to get SQE for fsync\n");
-    }
-    // Prepare the fsync operation
-    io_uring_prep_fsync(
-        sqe, fd,
-        0);  // Use 0 for fsync flags to synchronize both data and metadata
-
-    // Submit the queue
-    ret = io_uring_submit(&ring);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_submit failed: %d\n", ret);
-    }
-
-    // Wait for completion of the write operation
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-    }
-    if (cqe->res < 0) {
-      fprintf(stderr, "Write operation failed: %d\n", cqe->res);
-    }
-    io_uring_cqe_seen(&ring, cqe);
-
-    // Wait for completion of the fsync operation
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-    }
-    if (cqe->res < 0) {
-      fprintf(stderr, "Fsync operation failed: %d\n", cqe->res);
-    }
-    io_uring_cqe_seen(&ring, cqe);
-    int sync_success = ret;
-    // bool sync_success = ::fsync(fd) == 0;
+    bool sync_success = ::fsync(fd) == 0;
 #endif  // HAVE_FDATASYNC
     if (sync_success) {
       return Status::OK();

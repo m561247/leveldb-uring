@@ -66,7 +66,7 @@ static const char* FLAGS_benchmarks =
     ;
 
 // Number of key/values to place in database
-static int FLAGS_num = 1000000;
+static int FLAGS_num = 10000;
 
 // Number of read operations to do.  If negative, do FLAGS_num reads.
 static int FLAGS_reads = -1;
@@ -856,6 +856,10 @@ class Benchmark {
         batch.Put(key.slice(), gen.Generate(value_size_));
         bytes += value_size_ + key.slice().size();
         thread->stats.FinishedSingleOp();
+      }
+      if (i == 31000) {
+        printf("number = %d\n", i);
+        // 
       }
       s = db_->Write(write_options_, &batch);
       if (!s.ok()) {
