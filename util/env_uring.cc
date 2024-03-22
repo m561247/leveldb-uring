@@ -38,9 +38,9 @@
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
 #define IO_URING 1
-#define QUEUE_DEPTH 128
+#define QUEUE_DEPTH 256
 #define HAVE_FDATASYNC 0
-#define POSIX 0
+#define POSIX 1
 
 namespace leveldb {
 
@@ -298,9 +298,9 @@ class PosixWritableFile final : public WritableFile {
   ~PosixWritableFile() override {
     if (fd_ >= 0) {
       // Ignoring any potential errors
-      io_uring_queue_exit(&ring);
       Close();
     }
+    io_uring_queue_exit(&ring);
   }
 
   Status Append(const Slice& data) override {
@@ -360,7 +360,7 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
 
-    return SyncFd(fd_, filename_, ring);
+    return SyncFd(fd_, filename_, &ring);
   }
 
  private:
@@ -407,18 +407,18 @@ class PosixWritableFile final : public WritableFile {
         return PosixError("Submit failed", ret);
       }
 
-      struct io_uring_cqe* cqe;
-      ret = io_uring_wait_cqe(&ring, &cqe);
-      if (ret < 0) {
-        return PosixError("Wait for completion failed", ret);
-      }
+      // struct io_uring_cqe* cqe;
+      // ret = io_uring_wait_cqe(&ring, &cqe);
+      // if (ret < 0) {
+      //   return PosixError("Wait for completion failed", ret);
+      // }
 
-      if (cqe->res < 0) {
-        io_uring_cqe_seen(&ring, cqe);
-        return PosixError("Writev operation failed", -cqe->res);
-      }
+      // if (cqe->res < 0) {
+      //   io_uring_cqe_seen(&ring, cqe);
+      //   return PosixError("Writev operation failed", -cqe->res);
+      // }
 
-      io_uring_cqe_seen(&ring, cqe);
+      // io_uring_cqe_seen(&ring, cqe);
 
       // Assuming the entire write was successful if no errors occurred.
       // In practice, you might need to handle partial writes or retries for the
@@ -437,7 +437,7 @@ class PosixWritableFile final : public WritableFile {
     if (fd < 0) {
       status = PosixError(dirname_, errno);
     } else {
-      status = SyncFd(fd, dirname_, ring);
+      status = SyncFd(fd, dirname_, &ring);
       ::close(fd);
     }
     return status;
@@ -450,7 +450,7 @@ class PosixWritableFile final : public WritableFile {
   // The path argument is only used to populate the description string in the
   // returned Status if an error occurs.
   static Status SyncFd(int fd, const std::string& fd_path,
-                       struct io_uring ring) {
+                       struct io_uring *ring) {
 #if HAVE_FULLFSYNC
     // On macOS and iOS, fsync() doesn't guarantee durability past power
     // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
@@ -463,13 +463,37 @@ class PosixWritableFile final : public WritableFile {
 
 #if HAVE_FDATASYNC
     bool sync_success = ::fdatasync(fd) == 0;
+// io_uring
+#elif IO_URING
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+      return PosixError("Failed to get SQE", errno);
+    }
+    io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+
+    io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
+    int ret = io_uring_submit(ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
+    }
+
+    // ret = io_uring_wait_cqe(ring, &cqe);
+    // if (ret) {
+    //   fprintf(stderr, "wait_cqe %d\n", ret);
+    //   return PosixError("wait_cqe", errno);
+    // }
+
+    // io_uring_cqe_seen(ring, cqe);
+    return Status::OK();
 #else
     bool sync_success = ::fsync(fd) == 0;
 #endif  // HAVE_FDATASYNC
-    if (sync_success) {
-      return Status::OK();
-    }
-    return PosixError(fd_path, errno);
+    // if (sync_success) {
+    //   return Status::OK();
+    // }
+    // return PosixError(fd_path, errno);
   }
 
   // Returns the directory name in a path pointing to a file.
@@ -680,7 +704,6 @@ class PosixEnv : public Env {
   }
 
   Status CreateDir(const std::string& dirname) override {
-    std::cout << dirname.c_str() << std::endl;
     if (::mkdir(dirname.c_str(), 0755) != 0) {
       return PosixError(dirname, errno);
     }
@@ -705,7 +728,6 @@ class PosixEnv : public Env {
   }
 
   Status RenameFile(const std::string& from, const std::string& to) override {
-    std::cout << to.c_str() << std::endl;
     if (std::rename(from.c_str(), to.c_str()) != 0) {
       return PosixError(from, errno);
     }
