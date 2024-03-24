@@ -37,10 +37,11 @@
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
-#define IO_URING 1
 #define QUEUE_DEPTH 256
 #define HAVE_FDATASYNC 0
-#define POSIX 1
+#define IO_URING_FSYNC 1
+#define POSIX_WRITE 0
+#define ASYNC_APPEND 0
 
 namespace leveldb {
 
@@ -62,7 +63,8 @@ constexpr const int kOpenBaseFlags = O_CLOEXEC;
 constexpr const int kOpenBaseFlags = 0;
 #endif  // defined(HAVE_O_CLOEXEC)
 
-constexpr const size_t kWritableFileBufferSize = 65536;
+// constexpr const size_t kWritableFileBufferSize = 65536;
+constexpr const size_t kWritableFileBufferSize = 4 * 1024 * 1024;
 
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
@@ -288,7 +290,8 @@ class PosixWritableFile final : public WritableFile {
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
         dirname_(Dirname(filename_)) {
-    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
       // Handle initialization failure
       // You might want to throw an exception or set an error flag
       printf("Failed to initialize io_uring");
@@ -302,17 +305,33 @@ class PosixWritableFile final : public WritableFile {
     }
     io_uring_queue_exit(&ring);
   }
-
+#if ASYNC_APPEND
   Status Append(const Slice& data) override {
+    // todo
     size_t write_size = data.size();
     const char* write_data = data.data();
-
     // Fit as much as possible into buffer.
     size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
     std::memcpy(buf_ + pos_, write_data, copy_size);
     write_data += copy_size;
     write_size -= copy_size;
     pos_ += copy_size;
+
+    if (write_size == 0) {
+      return Status::OK();
+    }
+  }
+#else
+  Status Append(const Slice& data) override {
+    size_t write_size = data.size();
+    const char* write_data = data.data();
+    // Fit as much as possible into buffer.
+    size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
+    std::memcpy(buf_ + pos_, write_data, copy_size);
+    write_data += copy_size;
+    write_size -= copy_size;
+    pos_ += copy_size;
+
     if (write_size == 0) {
       return Status::OK();
     }
@@ -331,7 +350,7 @@ class PosixWritableFile final : public WritableFile {
     }
     return WriteUnbuffered(write_data, write_size);
   }
-
+#endif
   Status Close() override {
     Status status = FlushBuffer();
     const int close_result = ::close(fd_);
@@ -350,6 +369,9 @@ class PosixWritableFile final : public WritableFile {
     // This needs to happen before the manifest file is flushed to disk, to
     // avoid crashing in a state where the manifest refers to files that are not
     // yet on disk.
+    if (filename_ == "/tmp/leveldbtest-1000/dbbench/000005.ldb") {
+      printf("/tmp/leveldbtest-1000/dbbench/000005.ldb");
+    }
     Status status = SyncDirIfManifest();
     if (!status.ok()) {
       return status;
@@ -370,7 +392,7 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-#if POSIX
+#if POSIX_WRITE
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
       ssize_t write_result = ::write(fd_, data, size);
@@ -388,41 +410,50 @@ class PosixWritableFile final : public WritableFile {
 #else
 
   Status WriteUnbuffered(const char* data, size_t size) {
-    if (size > 0) {
-      struct iovec iov = {
-          .iov_base = (void*)data,  // Cast to void* because iovec expects it
-          .iov_len = size};
-
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (filename_ == "/tmp/leveldbtest-1000/dbbench/000005.ldb") {
+      printf("/tmp/leveldbtest-1000/dbbench/000005.ldb\n");
+    }
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    int ret;
+    while (size > 0) {
+      // Get a submission queue entry
+      // Get a submission queue entry
+      sqe = io_uring_get_sqe(&ring);
       if (!sqe) {
-        return PosixError("Failed to get SQE", errno);
+        io_uring_queue_exit(&ring);
+        return PosixError("Failed to get submission queue entry", errno);
       }
 
-      io_uring_prep_writev(sqe, fd_, &iov, 1,
-                           0);  // Assuming fd_ is your file descriptor
+      // Set up the write operation
+      io_uring_prep_write(sqe, fd_, data, size, -1);
 
-      int ret = io_uring_submit(&ring);
-
+      // Submit the write operation
+      ret = io_uring_submit(&ring);
       if (ret < 0) {
-        return PosixError("Submit failed", ret);
+        io_uring_queue_exit(&ring);
+        return PosixError("io_uring_submit failed", -ret);
       }
 
-      // struct io_uring_cqe* cqe;
-      // ret = io_uring_wait_cqe(&ring, &cqe);
-      // if (ret < 0) {
-      //   return PosixError("Wait for completion failed", ret);
-      // }
+      // Wait for the completion of the write operation
+      ret = io_uring_wait_cqe(&ring, &cqe);
+      if (ret < 0) {
+        io_uring_queue_exit(&ring);
+        return PosixError("io_uring_wait_cqe failed", -ret);
+      }
 
-      // if (cqe->res < 0) {
-      //   io_uring_cqe_seen(&ring, cqe);
-      //   return PosixError("Writev operation failed", -cqe->res);
-      // }
+      // Check the result of the write operation
+      if (cqe->res < 0) {
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_queue_exit(&ring);
+        return PosixError("Write operation failed", -cqe->res);
+      }
 
-      // io_uring_cqe_seen(&ring, cqe);
+      // Adjust pointers and sizes based on the completed write
+      data += cqe->res;
+      size -= cqe->res;
 
-      // Assuming the entire write was successful if no errors occurred.
-      // In practice, you might need to handle partial writes or retries for the
-      // unsent portion.
+      io_uring_cqe_seen(&ring, cqe);
     }
     return Status::OK();
   }
@@ -450,7 +481,7 @@ class PosixWritableFile final : public WritableFile {
   // The path argument is only used to populate the description string in the
   // returned Status if an error occurs.
   static Status SyncFd(int fd, const std::string& fd_path,
-                       struct io_uring *ring) {
+                       struct io_uring* ring) {
 #if HAVE_FULLFSYNC
     // On macOS and iOS, fsync() doesn't guarantee durability past power
     // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
@@ -464,7 +495,7 @@ class PosixWritableFile final : public WritableFile {
 #if HAVE_FDATASYNC
     bool sync_success = ::fdatasync(fd) == 0;
 // io_uring
-#elif IO_URING
+#elif IO_URING_FSYNC
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
     sqe = io_uring_get_sqe(ring);
@@ -473,27 +504,28 @@ class PosixWritableFile final : public WritableFile {
     }
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
-    io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
+    io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
     int ret = io_uring_submit(ring);
     if (ret <= 0) {
       printf("Submition failed of fsync !\n");
     }
 
-    // ret = io_uring_wait_cqe(ring, &cqe);
-    // if (ret) {
-    //   fprintf(stderr, "wait_cqe %d\n", ret);
-    //   return PosixError("wait_cqe", errno);
-    // }
+    ret = io_uring_wait_cqe(ring, &cqe);
+    if (ret) {
+      fprintf(stderr, "wait_cqe %d\n", ret);
+      return PosixError("wait_cqe", errno);
+    }
 
-    // io_uring_cqe_seen(ring, cqe);
+    io_uring_cqe_seen(ring, cqe);
     return Status::OK();
 #else
     bool sync_success = ::fsync(fd) == 0;
+
+    if (sync_success) {
+      return Status::OK();
+    }
+    return PosixError(fd_path, errno);
 #endif  // HAVE_FDATASYNC
-    // if (sync_success) {
-    //   return Status::OK();
-    // }
-    // return PosixError(fd_path, errno);
   }
 
   // Returns the directory name in a path pointing to a file.
@@ -537,7 +569,6 @@ class PosixWritableFile final : public WritableFile {
   char buf_[kWritableFileBufferSize];
   size_t pos_;
   int fd_;
-
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
