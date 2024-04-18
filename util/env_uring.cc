@@ -41,7 +41,7 @@
 #define HAVE_FDATASYNC 0
 #define IO_URING_FSYNC 1
 #define POSIX_WRITE 0
-
+#define URING_APPEND 0
 namespace leveldb {
 
 namespace {
@@ -304,7 +304,29 @@ class PosixWritableFile final : public WritableFile {
     }
     io_uring_queue_exit(&ring);
   }
+#if URING_APPEND
+  Status Append(const Slice& data) override {
+    size_t size = data.size();
+    const char* write_data = data.data();
+    struct iovec iov = {
+        .iov_base =
+            (void*)write_data,  // Cast to void* because iovec expects it
+        .iov_len = size};
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    int ret;
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      io_uring_queue_exit(&ring);
+      return PosixError("Failed to get submission queue entry", errno);
+    }
 
+    // Set up the write operation
+    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    return Status::OK();
+  }
+
+#else
   Status Append(const Slice& data) override {
     size_t write_size = data.size();
     const char* write_data = data.data();
@@ -333,7 +355,9 @@ class PosixWritableFile final : public WritableFile {
     }
     return WriteUnbuffered(write_data, write_size);
   }
+#endif
 
+#if URING_APPEND
   Status Close() override {
     Status status = FlushBuffer();
     const int close_result = ::close(fd_);
@@ -343,9 +367,25 @@ class PosixWritableFile final : public WritableFile {
     fd_ = -1;
     return status;
   }
+#else
+  Status Close() override {
+    Status status = FlushBuffer();
+    const int close_result = ::close(fd_);
+    if (close_result < 0 && status.ok()) {
+      status = PosixError(filename_, errno);
+    }
+    fd_ = -1;
+    return status;
+  }
+#endif
 
-  Status Flush() override { return FlushBuffer(); }
+#if IO_URING_FSYNC
+  Status Flush() override { return Status::OK(); }
+#endif
 
+#if POSIX_WRITE
+  Status Flush() override { return Status::OK(); }
+#else
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
     //
@@ -363,25 +403,41 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
     status = SyncFd(fd_, filename_, &ring);
-    this->writes = 0;
     return status;
   }
-
+#endif
  private:
+#if URING_APPEND
+  Status FlushBuffer() {
+    struct io_uring_cqe* cqe;
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_submit failed", -ret);
+    }
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_wait_cqe failed", -ret);
+    }
+
+    // Check the result of the write operation
+    if (cqe->res < 0) {
+      io_uring_cqe_seen(&ring, cqe);
+      io_uring_queue_exit(&ring);
+      return PosixError("Write operation failed", -cqe->res);
+    }
+
+    io_uring_cqe_seen(&ring, cqe);
+    return Status::OK();
+  }
+#else
   Status FlushBuffer() {
     Status status = WriteUnbuffered(buf_, pos_);
     pos_ = 0;
     return status;
   }
-  bool endsWith(const std::string& filename, const std::string& suffix) {
-    if (filename.length() >= suffix.length()) {
-      // Compare the end of filename with the suffix
-      return (0 == filename.compare(filename.length() - suffix.length(),
-                                    suffix.length(), suffix));
-    } else {
-      return false;
-    }
-  }
+#endif
 #if POSIX_WRITE
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
@@ -397,9 +453,10 @@ class PosixWritableFile final : public WritableFile {
     }
     return Status::OK();
   }
-#else
+#elif !URING_APPEND
 
   Status WriteUnbuffered(const char* data, size_t size) {
+    if (size == 0) return Status::OK();
     struct iovec iov = {
         .iov_base = (void*)data,  // Cast to void* because iovec expects it
         .iov_len = size};
@@ -416,14 +473,13 @@ class PosixWritableFile final : public WritableFile {
     // Set up the write operation
     io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     // Submit the write operation
-
     ret = io_uring_submit(&ring);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
       return PosixError("io_uring_submit failed", -ret);
     }
 
-    // // Wait for the completion of the write operation
+    // Wait for the completion of the write operation
     // ret = io_uring_wait_cqe(&ring, &cqe);
     // if (ret < 0) {
     //   io_uring_queue_exit(&ring);
@@ -431,6 +487,31 @@ class PosixWritableFile final : public WritableFile {
     // }
 
     //   // Check the result of the write operation
+    // if (cqe->res < 0) {
+    //   io_uring_cqe_seen(&ring, cqe);
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("Write operation failed", -cqe->res);
+    // }
+
+    // io_uring_cqe_seen(&ring, cqe);
+    return Status::OK();
+  }
+#elif URING_APPEND
+  Status WriteUnbuffered(const char* data, size_t size) {
+    struct io_uring_cqe* cqe;
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_submit failed", -ret);
+    }
+    // Wait for the completion of the write operation
+    // ret = io_uring_wait_cqe(&ring, &cqe);
+    // if (ret < 0) {
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("io_uring_wait_cqe failed", -ret);
+    // }
+
+    // // Check the result of the write operation
     // if (cqe->res < 0) {
     //   io_uring_cqe_seen(&ring, cqe);
     //   io_uring_queue_exit(&ring);
@@ -452,7 +533,7 @@ class PosixWritableFile final : public WritableFile {
       status = PosixError(dirname_, errno);
     } else {
       status = SyncFd(fd, dirname_, &ring);
-      this->writes = 0;
+
       ::close(fd);
     }
     return status;
