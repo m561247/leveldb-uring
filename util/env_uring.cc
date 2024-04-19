@@ -37,7 +37,7 @@
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
-#define QUEUE_DEPTH 256
+#define QUEUE_DEPTH 512
 #define HAVE_FDATASYNC 0
 #define IO_URING_FSYNC 1
 #define POSIX_WRITE 0
@@ -384,7 +384,7 @@ class PosixWritableFile final : public WritableFile {
 #endif
 
 #if POSIX_WRITE
-  Status Flush() override { return Status::OK(); }
+  Status Flush() override { return FlushBuffer(); }
 #else
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
@@ -473,6 +473,7 @@ class PosixWritableFile final : public WritableFile {
     // Set up the write operation
     io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     // Submit the write operation
+    // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
     ret = io_uring_submit(&ring);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
@@ -480,18 +481,18 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Wait for the completion of the write operation
-    // ret = io_uring_wait_cqe(&ring, &cqe);
-    // if (ret < 0) {
-    //   io_uring_queue_exit(&ring);
-    //   return PosixError("io_uring_wait_cqe failed", -ret);
-    // }
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_wait_cqe failed", -ret);
+    }
 
-    //   // Check the result of the write operation
-    // if (cqe->res < 0) {
-    //   io_uring_cqe_seen(&ring, cqe);
-    //   io_uring_queue_exit(&ring);
-    //   return PosixError("Write operation failed", -cqe->res);
-    // }
+      // Check the result of the write operation
+    if (cqe->res < 0) {
+      io_uring_cqe_seen(&ring, cqe);
+      io_uring_queue_exit(&ring);
+      return PosixError("Write operation failed", -cqe->res);
+    }
 
     // io_uring_cqe_seen(&ring, cqe);
     return Status::OK();
