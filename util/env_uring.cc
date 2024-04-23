@@ -38,8 +38,8 @@
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
 #define QUEUE_DEPTH 512
-#define HAVE_FDATASYNC 0
-#define IO_URING_FSYNC 1
+#define HAVE_FDATASYNC 1
+#define IO_URING_FSYNC 0
 #define POSIX_WRITE 0
 #define URING_APPEND 0
 namespace leveldb {
@@ -357,7 +357,7 @@ class PosixWritableFile final : public WritableFile {
   }
 #endif
 
-#if URING_APPEND
+
   Status Close() override {
     Status status = FlushBuffer();
     const int close_result = ::close(fd_);
@@ -367,25 +367,13 @@ class PosixWritableFile final : public WritableFile {
     fd_ = -1;
     return status;
   }
-#else
-  Status Close() override {
-    Status status = FlushBuffer();
-    const int close_result = ::close(fd_);
-    if (close_result < 0 && status.ok()) {
-      status = PosixError(filename_, errno);
-    }
-    fd_ = -1;
-    return status;
-  }
-#endif
 
 #if IO_URING_FSYNC
   Status Flush() override { return Status::OK(); }
+#else
+    Status Flush() override { return FlushBuffer(); }
 #endif
 
-#if POSIX_WRITE
-  Status Flush() override { return FlushBuffer(); }
-#else
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
     //
@@ -405,7 +393,6 @@ class PosixWritableFile final : public WritableFile {
     status = SyncFd(fd_, filename_, &ring);
     return status;
   }
-#endif
  private:
 #if URING_APPEND
   Status FlushBuffer() {
@@ -494,7 +481,7 @@ class PosixWritableFile final : public WritableFile {
       return PosixError("Write operation failed", -cqe->res);
     }
 
-    // io_uring_cqe_seen(&ring, cqe);
+    io_uring_cqe_seen(&ring, cqe);
     return Status::OK();
   }
 #elif URING_APPEND
@@ -886,7 +873,7 @@ class PosixEnv : public Env {
       *result = env;
     } else {
       char buf[100];
-      std::snprintf(buf, sizeof(buf), "/tmp/leveldbtest-%d",
+      std::snprintf(buf, sizeof(buf), "/mnt/leveldb/leveldbtest-%d",
                     static_cast<int>(::geteuid()));
       *result = buf;
     }

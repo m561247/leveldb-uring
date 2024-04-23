@@ -48,15 +48,15 @@ static const char* FLAGS_benchmarks =
     "fillseq,"
     "fillsync,"
     "fillrandom,"
-    "overwrite,"
-    "readrandom,"
-    "readrandom,"  // Extra run to allow previous compactions to quiesce
-    "readseq,"
-    "readreverse,"
-    "compact,"
-    "readrandom,"
-    "readseq,"
-    "readreverse,"
+    // "overwrite,"
+    // "readrandom,"
+    // "readrandom,"  // Extra run to allow previous compactions to quiesce
+    // "readseq,"
+    // "readreverse,"
+    // "compact,"
+    // "readrandom,"
+    // "readseq,"
+    // "readreverse,"
     // "fill100K,"
     // "crc32c,"
     // "snappycomp,"
@@ -601,7 +601,7 @@ class Benchmark {
         method = &Benchmark::WriteRandom;
       } else if (name == Slice("fill100K")) {
         fresh_db = true;
-        num_ /= 1000;
+        num_ /= 100;
         value_size_ = 100 * 1000;
         method = &Benchmark::WriteRandom;
       } else if (name == Slice("readseq")) {
