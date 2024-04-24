@@ -38,10 +38,10 @@
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
 #define QUEUE_DEPTH 512
-#define HAVE_FDATASYNC 1
-#define IO_URING_FSYNC 0
+#define HAVE_FDATASYNC 0
+#define IO_URING_FSYNC 1
 #define POSIX_WRITE 0
-#define URING_APPEND 0
+#define URING_APPEND 1
 namespace leveldb {
 
 namespace {
@@ -289,10 +289,15 @@ class PosixWritableFile final : public WritableFile {
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
         dirname_(Dirname(filename_)) {
+    // memset(&params, 0, sizeof(params));
+    // params.flags |= IORING_SETUP_SQPOLL;
+    // params.flags |= IORING_FEAT_SQPOLL_NONFIXED;
+    // params.sq_thread_idle = 2000;
+    // int ret = io_uring_queue_init_params(8, &ring, &params);
+
     int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     if (ret < 0) {
       // Handle initialization failure
-      // You might want to throw an exception or set an error flag
       printf("Failed to initialize io_uring");
     }
   }
@@ -306,12 +311,9 @@ class PosixWritableFile final : public WritableFile {
   }
 #if URING_APPEND
   Status Append(const Slice& data) override {
-    size_t size = data.size();
+    size_t write_size = data.size();
     const char* write_data = data.data();
-    struct iovec iov = {
-        .iov_base =
-            (void*)write_data,  // Cast to void* because iovec expects it
-        .iov_len = size};
+
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
     int ret;
@@ -320,9 +322,47 @@ class PosixWritableFile final : public WritableFile {
       io_uring_queue_exit(&ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
+    size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
 
     // Set up the write operation
-    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    io_uring_prep_write(sqe, fd_, (void *)write_data, write_size, -1);
+    write_data += copy_size;
+    write_size -= copy_size;
+    pos_ += copy_size;
+    if (write_size == 0) {
+      return Status::OK();
+    }
+    if (write_size > kWritableFileBufferSize)
+      return WriteUnbuffered(write_data, write_size);
+    // Can't fit in buffer, so need to do at least one write.
+    // Status status = FlushBuffer();
+    ret = io_uring_submit(&ring);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_submit failed", -ret);
+    }
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      if (ret_cqe < 0) {
+        io_uring_queue_exit(&ring);
+        return PosixError("io_uring_wait_cqe failed", -ret);
+      }
+
+      //   // Check the result of the write operation
+      if (cqe->res < 0) {
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_queue_exit(&ring);
+        return PosixError("Write operation failed", -cqe->res);
+      }
+      io_uring_cqe_seen(&ring, cqe);
+    }
+
+    struct iovec iov_rest = {
+        .iov_base =
+            (void*)write_data,  // Cast to void* because iovec expects it
+        .iov_len = write_size};
+    io_uring_prep_writev(sqe, fd_, &iov_rest, 1, -1);
+    pos_ = write_size;
     return Status::OK();
   }
 
@@ -357,7 +397,6 @@ class PosixWritableFile final : public WritableFile {
   }
 #endif
 
-
   Status Close() override {
     Status status = FlushBuffer();
     const int close_result = ::close(fd_);
@@ -369,9 +408,9 @@ class PosixWritableFile final : public WritableFile {
   }
 
 #if IO_URING_FSYNC
-  Status Flush() override { return Status::OK(); }
+  Status Flush() override { return FlushBuffer(); }
 #else
-    Status Flush() override { return FlushBuffer(); }
+  Status Flush() override { return FlushBuffer(); }
 #endif
 
   Status Sync() override {
@@ -393,29 +432,35 @@ class PosixWritableFile final : public WritableFile {
     status = SyncFd(fd_, filename_, &ring);
     return status;
   }
+
  private:
 #if URING_APPEND
   Status FlushBuffer() {
-    struct io_uring_cqe* cqe;
+    if (pos_ == 0) {
+      return Status::OK();
+    }
     int ret = io_uring_submit(&ring);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
       return PosixError("io_uring_submit failed", -ret);
     }
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      io_uring_queue_exit(&ring);
-      return PosixError("io_uring_wait_cqe failed", -ret);
-    }
+    struct io_uring_cqe* cqe;
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      if (ret_cqe < 0) {
+        io_uring_queue_exit(&ring);
+        return PosixError("io_uring_wait_cqe failed", -ret);
+      }
 
-    // Check the result of the write operation
-    if (cqe->res < 0) {
+      //   // Check the result of the write operation
+      if (cqe->res < 0) {
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_queue_exit(&ring);
+        return PosixError("Write operation failed", -cqe->res);
+      }
       io_uring_cqe_seen(&ring, cqe);
-      io_uring_queue_exit(&ring);
-      return PosixError("Write operation failed", -cqe->res);
     }
-
-    io_uring_cqe_seen(&ring, cqe);
+    pos_ = 0;
     return Status::OK();
   }
 #else
@@ -461,37 +506,12 @@ class PosixWritableFile final : public WritableFile {
     io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     // Submit the write operation
     // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
-    ret = io_uring_submit(&ring);
+    ret = io_uring_submit_and_wait(&ring, 1);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
       return PosixError("io_uring_submit failed", -ret);
     }
 
-    // Wait for the completion of the write operation
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      io_uring_queue_exit(&ring);
-      return PosixError("io_uring_wait_cqe failed", -ret);
-    }
-
-      // Check the result of the write operation
-    if (cqe->res < 0) {
-      io_uring_cqe_seen(&ring, cqe);
-      io_uring_queue_exit(&ring);
-      return PosixError("Write operation failed", -cqe->res);
-    }
-
-    io_uring_cqe_seen(&ring, cqe);
-    return Status::OK();
-  }
-#elif URING_APPEND
-  Status WriteUnbuffered(const char* data, size_t size) {
-    struct io_uring_cqe* cqe;
-    int ret = io_uring_submit(&ring);
-    if (ret < 0) {
-      io_uring_queue_exit(&ring);
-      return PosixError("io_uring_submit failed", -ret);
-    }
     // Wait for the completion of the write operation
     // ret = io_uring_wait_cqe(&ring, &cqe);
     // if (ret < 0) {
@@ -499,7 +519,7 @@ class PosixWritableFile final : public WritableFile {
     //   return PosixError("io_uring_wait_cqe failed", -ret);
     // }
 
-    // // Check the result of the write operation
+    //   // Check the result of the write operation
     // if (cqe->res < 0) {
     //   io_uring_cqe_seen(&ring, cqe);
     //   io_uring_queue_exit(&ring);
@@ -507,6 +527,51 @@ class PosixWritableFile final : public WritableFile {
     // }
 
     // io_uring_cqe_seen(&ring, cqe);
+    io_uring_cq_advance(&ring, 1);
+    return Status::OK();
+  }
+#elif URING_APPEND
+  Status WriteUnbuffered(const char* data, size_t size) {
+    if (size == 0) return Status::OK();
+    struct iovec iov = {
+        .iov_base = (void*)data,  // Cast to void* because iovec expects it
+        .iov_len = size};
+
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    int ret;
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      io_uring_queue_exit(&ring);
+      return PosixError("Failed to get submission queue entry", errno);
+    }
+
+    // Set up the write operation
+    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    // Submit the write operation
+    // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
+    ret = io_uring_submit_and_wait(&ring, 1);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_submit failed", -ret);
+    }
+
+    // Wait for the completion of the write operation
+    // ret = io_uring_wait_cqe(&ring, &cqe);
+    // if (ret < 0) {
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("io_uring_wait_cqe failed", -ret);
+    // }
+
+    //   // Check the result of the write operation
+    // if (cqe->res < 0) {
+    //   io_uring_cqe_seen(&ring, cqe);
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("Write operation failed", -cqe->res);
+    // }
+
+    // io_uring_cqe_seen(&ring, cqe);
+    io_uring_cq_advance(&ring, 1);
     return Status::OK();
   }
 #endif
@@ -632,6 +697,7 @@ class PosixWritableFile final : public WritableFile {
   const std::string dirname_;  // The directory of filename_.
   int writes;
   struct io_uring ring;
+  struct io_uring_params params;
 };
 
 int LockOrUnlock(int fd, bool lock) {
