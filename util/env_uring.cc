@@ -41,7 +41,7 @@
 #define HAVE_FDATASYNC 0
 #define IO_URING_FSYNC 1
 #define POSIX_WRITE 0
-#define URING_APPEND 1
+#define URING_APPEND 0
 namespace leveldb {
 
 namespace {
@@ -62,8 +62,8 @@ constexpr const int kOpenBaseFlags = O_CLOEXEC;
 constexpr const int kOpenBaseFlags = 0;
 #endif  // defined(HAVE_O_CLOEXEC)
 
-// constexpr const size_t kWritableFileBufferSize = 65536;
-constexpr const size_t kWritableFileBufferSize = 4 * 1024 * 1024;
+constexpr const size_t kWritableFileBufferSize = 65536;
+// constexpr const size_t kWritableFileBufferSize = 4 * 1024 * 1024;
 
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
@@ -289,15 +289,10 @@ class PosixWritableFile final : public WritableFile {
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
         dirname_(Dirname(filename_)) {
-    // memset(&params, 0, sizeof(params));
-    // params.flags |= IORING_SETUP_SQPOLL;
-    // params.flags |= IORING_FEAT_SQPOLL_NONFIXED;
-    // params.sq_thread_idle = 2000;
-    // int ret = io_uring_queue_init_params(8, &ring, &params);
-
     int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     if (ret < 0) {
       // Handle initialization failure
+      // You might want to throw an exception or set an error flag
       printf("Failed to initialize io_uring");
     }
   }
@@ -311,9 +306,12 @@ class PosixWritableFile final : public WritableFile {
   }
 #if URING_APPEND
   Status Append(const Slice& data) override {
-    size_t write_size = data.size();
+    size_t size = data.size();
     const char* write_data = data.data();
-
+    struct iovec iov = {
+        .iov_base =
+            (void*)write_data,  // Cast to void* because iovec expects it
+        .iov_len = size};
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
     int ret;
@@ -322,47 +320,9 @@ class PosixWritableFile final : public WritableFile {
       io_uring_queue_exit(&ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
-    size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
 
     // Set up the write operation
-    io_uring_prep_write(sqe, fd_, (void *)write_data, write_size, -1);
-    write_data += copy_size;
-    write_size -= copy_size;
-    pos_ += copy_size;
-    if (write_size == 0) {
-      return Status::OK();
-    }
-    if (write_size > kWritableFileBufferSize)
-      return WriteUnbuffered(write_data, write_size);
-    // Can't fit in buffer, so need to do at least one write.
-    // Status status = FlushBuffer();
-    ret = io_uring_submit(&ring);
-    if (ret < 0) {
-      io_uring_queue_exit(&ring);
-      return PosixError("io_uring_submit failed", -ret);
-    }
-    for (int i = 0; i < ret; i++) {
-      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
-      if (ret_cqe < 0) {
-        io_uring_queue_exit(&ring);
-        return PosixError("io_uring_wait_cqe failed", -ret);
-      }
-
-      //   // Check the result of the write operation
-      if (cqe->res < 0) {
-        io_uring_cqe_seen(&ring, cqe);
-        io_uring_queue_exit(&ring);
-        return PosixError("Write operation failed", -cqe->res);
-      }
-      io_uring_cqe_seen(&ring, cqe);
-    }
-
-    struct iovec iov_rest = {
-        .iov_base =
-            (void*)write_data,  // Cast to void* because iovec expects it
-        .iov_len = write_size};
-    io_uring_prep_writev(sqe, fd_, &iov_rest, 1, -1);
-    pos_ = write_size;
+    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     return Status::OK();
   }
 
@@ -408,7 +368,7 @@ class PosixWritableFile final : public WritableFile {
   }
 
 #if IO_URING_FSYNC
-  Status Flush() override { return FlushBuffer(); }
+  Status Flush() override { return Status::OK(); }
 #else
   Status Flush() override { return FlushBuffer(); }
 #endif
@@ -436,34 +396,30 @@ class PosixWritableFile final : public WritableFile {
  private:
 #if URING_APPEND
   Status FlushBuffer() {
-    if (pos_ == 0) {
-      return Status::OK();
-    }
+    struct io_uring_cqe* cqe;
     int ret = io_uring_submit(&ring);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
       return PosixError("io_uring_submit failed", -ret);
     }
-    struct io_uring_cqe* cqe;
-    for (int i = 0; i < ret; i++) {
-      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
-      if (ret_cqe < 0) {
-        io_uring_queue_exit(&ring);
-        return PosixError("io_uring_wait_cqe failed", -ret);
-      }
-
-      //   // Check the result of the write operation
-      if (cqe->res < 0) {
-        io_uring_cqe_seen(&ring, cqe);
-        io_uring_queue_exit(&ring);
-        return PosixError("Write operation failed", -cqe->res);
-      }
-      io_uring_cqe_seen(&ring, cqe);
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+      io_uring_queue_exit(&ring);
+      return PosixError("io_uring_wait_cqe failed", -ret);
     }
-    pos_ = 0;
+
+    // Check the result of the write operation
+    if (cqe->res < 0) {
+      io_uring_cqe_seen(&ring, cqe);
+      io_uring_queue_exit(&ring);
+      return PosixError("Write operation failed", -cqe->res);
+    }
+
+    io_uring_cqe_seen(&ring, cqe);
     return Status::OK();
   }
 #else
+
   Status FlushBuffer() {
     Status status = WriteUnbuffered(buf_, pos_);
     pos_ = 0;
@@ -489,9 +445,9 @@ class PosixWritableFile final : public WritableFile {
 
   Status WriteUnbuffered(const char* data, size_t size) {
     if (size == 0) return Status::OK();
-    struct iovec iov = {
-        .iov_base = (void*)data,  // Cast to void* because iovec expects it
-        .iov_len = size};
+    // struct iovec iov = {
+    //     .iov_base = (void*)data,  // Cast to void* because iovec expects it
+    //     .iov_len = size};
 
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
@@ -503,9 +459,10 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Set up the write operation
-    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
     // Submit the write operation
-    // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
+    io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
     ret = io_uring_submit_and_wait(&ring, 1);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
@@ -519,43 +476,24 @@ class PosixWritableFile final : public WritableFile {
     //   return PosixError("io_uring_wait_cqe failed", -ret);
     // }
 
-    //   // Check the result of the write operation
+    // // Check the result of the write operation
     // if (cqe->res < 0) {
     //   io_uring_cqe_seen(&ring, cqe);
     //   io_uring_queue_exit(&ring);
     //   return PosixError("Write operation failed", -cqe->res);
     // }
-
-    // io_uring_cqe_seen(&ring, cqe);
     io_uring_cq_advance(&ring, 1);
+    // io_uring_cqe_seen(&ring, cqe);
     return Status::OK();
   }
 #elif URING_APPEND
   Status WriteUnbuffered(const char* data, size_t size) {
-    if (size == 0) return Status::OK();
-    struct iovec iov = {
-        .iov_base = (void*)data,  // Cast to void* because iovec expects it
-        .iov_len = size};
-
-    struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
-    int ret;
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-      io_uring_queue_exit(&ring);
-      return PosixError("Failed to get submission queue entry", errno);
-    }
-
-    // Set up the write operation
-    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
-    // Submit the write operation
-    // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
-    ret = io_uring_submit_and_wait(&ring, 1);
+    int ret = io_uring_submit(&ring);
     if (ret < 0) {
       io_uring_queue_exit(&ring);
       return PosixError("io_uring_submit failed", -ret);
     }
-
     // Wait for the completion of the write operation
     // ret = io_uring_wait_cqe(&ring, &cqe);
     // if (ret < 0) {
@@ -563,7 +501,7 @@ class PosixWritableFile final : public WritableFile {
     //   return PosixError("io_uring_wait_cqe failed", -ret);
     // }
 
-    //   // Check the result of the write operation
+    // // Check the result of the write operation
     // if (cqe->res < 0) {
     //   io_uring_cqe_seen(&ring, cqe);
     //   io_uring_queue_exit(&ring);
@@ -571,7 +509,6 @@ class PosixWritableFile final : public WritableFile {
     // }
 
     // io_uring_cqe_seen(&ring, cqe);
-    io_uring_cq_advance(&ring, 1);
     return Status::OK();
   }
 #endif
@@ -627,19 +564,26 @@ class PosixWritableFile final : public WritableFile {
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
     io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
-    int ret = io_uring_submit(ring);
-    if (ret <= 0) {
-      printf("Submition failed of fsync !\n");
+    // int ret = io_uring_submit(ring);
+    // if (ret <= 0) {
+    //   printf("Submition failed of fsync !\n");
+    // }
+    int ret = io_uring_submit_and_wait(ring, 1);
+    if (ret < 0) {
+      io_uring_queue_exit(ring);
+      return PosixError("io_uring_submit failed", -ret);
     }
-    for (int i = 0; i < ret; i++) {
-      ret = io_uring_wait_cqe(ring, &cqe);
-      if (ret) {
-        fprintf(stderr, "wait_cqe %d\n", ret);
-        return PosixError("wait_cqe", errno);
-      }
 
-      io_uring_cqe_seen(ring, cqe);
-    }
+    // for (int i = 0; i < ret; i++) {
+    //   ret = io_uring_wait_cqe(ring, &cqe);
+    //   if (ret) {
+    //     fprintf(stderr, "wait_cqe %d\n", ret);
+    //     return PosixError("wait_cqe", errno);
+    //   }
+
+    //   io_uring_cqe_seen(ring, cqe);
+    // }
+    io_uring_cq_advance(ring, 1);
     return Status::OK();
 #else
     bool sync_success = ::fsync(fd) == 0;
@@ -697,7 +641,6 @@ class PosixWritableFile final : public WritableFile {
   const std::string dirname_;  // The directory of filename_.
   int writes;
   struct io_uring ring;
-  struct io_uring_params params;
 };
 
 int LockOrUnlock(int fd, bool lock) {
@@ -781,10 +724,10 @@ class PosixEnv : public Env {
       return PosixError(filename, errno);
     }
 
-    if (!mmap_limiter_.Acquire()) {
+    // if (!mmap_limiter_.Acquire()) {
       *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
       return Status::OK();
-    }
+    // }
 
     uint64_t file_size;
     Status status = GetFileSize(filename, &file_size);

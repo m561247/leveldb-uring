@@ -212,7 +212,7 @@ Status TestWritableFile::SyncParent() {
 Status TestWritableFile::Sync() {
   if (!env_->IsFilesystemActive()) {
     return Status::OK();
-  }
+  }`
   // Ensure new files referred to by the manifest are in the filesystem.
   Status s = target_->Sync();
   if (s.ok()) {
