@@ -339,21 +339,23 @@ class PosixWritableFile final : public WritableFile {
 
     if (write_size == 0) {
       return Status::OK();
+    } else {
+      return PosixError("Failed to Append", errno);
     }
 
     // Can't fit in buffer, so need to do at least one write.
-    Status status = FlushBuffer();
-    if (!status.ok()) {
-      return status;
-    }
+    // Status status = FlushBuffer();
+    // if (!status.ok()) {
+    //   return status;
+    // }
 
-    // Small writes go to buffer, large writes are written directly.
-    if (write_size < kWritableFileBufferSize) {
-      std::memcpy(buf_, write_data, write_size);
-      pos_ = write_size;
-      return Status::OK();
-    }
-    return WriteUnbuffered(write_data, write_size);
+    // // Small writes go to buffer, large writes are written directly.
+    // if (write_size < kWritableFileBufferSize) {
+    //   std::memcpy(buf_, write_data, write_size);
+    //   pos_ = write_size;
+    //   return Status::OK();
+    // }
+    // return WriteUnbuffered(write_data, write_size);
   }
 #endif
 
@@ -369,7 +371,7 @@ class PosixWritableFile final : public WritableFile {
   }
 
 #if IO_URING_FSYNC
-  Status Flush() override { return FlushBuffer(); }
+  Status Flush() override { return Status::OK(); }
 #else
     Status Flush() override { return FlushBuffer(); }
 #endif
