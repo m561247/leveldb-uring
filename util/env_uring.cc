@@ -37,7 +37,7 @@
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
-#define QUEUE_DEPTH 512
+#define QUEUE_DEPTH 5120
 #define HAVE_FDATASYNC 0
 #define IO_URING_FSYNC 1
 #define POSIX_WRITE 0
@@ -288,7 +288,8 @@ class PosixWritableFile final : public WritableFile {
         fd_(fd),
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
-        dirname_(Dirname(filename_)) {
+        dirname_(Dirname(filename_)),
+        sqe_count(0) {
     int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     if (ret < 0) {
       // Handle initialization failure
@@ -368,7 +369,7 @@ class PosixWritableFile final : public WritableFile {
   }
 
 #if IO_URING_FSYNC
-  Status Flush() override { return Status::OK(); }
+  Status Flush() override { return FlushBuffer(); }
 #else
   Status Flush() override { return FlushBuffer(); }
 #endif
@@ -391,6 +392,27 @@ class PosixWritableFile final : public WritableFile {
     }
     status = SyncFd(fd_, filename_, &ring);
     return status;
+  }
+
+  Status SyncAsync() override {
+    if (sqe_count == 0) return Status::OK();
+    struct io_uring_cqe* cqe;
+    int ret = io_uring_submit(&ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
+    }
+
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(&ring, cqe);
+    }
+    sqe_count = 0;
+    return Status::OK();
   }
 
  private:
@@ -421,7 +443,30 @@ class PosixWritableFile final : public WritableFile {
 #else
 
   Status FlushBuffer() {
+    if (pos_ == 0) return Status::OK();
     Status status = WriteUnbuffered(buf_, pos_);
+    // struct io_uring_cqe* cqe;
+    // int ret = io_uring_submit(&ring);
+    // if (ret < 0) {
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("io_uring_submit failed", -ret);
+    // }
+    // for (int i = 0; i < ret; i++) {
+    //   int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+    //   if (ret_cqe < 0) {
+    //     io_uring_queue_exit(&ring);
+    //     return PosixError("io_uring_wait_cqe failed", -ret);
+    //   }
+    //   // Check the result of the write operation
+    //   if (cqe->res < 0) {
+    //     io_uring_cqe_seen(&ring, cqe);
+    //     io_uring_queue_exit(&ring);
+    //     return PosixError("Write operation failed", -cqe->res);
+    //   }
+
+    //   io_uring_cqe_seen(&ring, cqe);
+    // }
+
     pos_ = 0;
     return status;
   }
@@ -453,7 +498,9 @@ class PosixWritableFile final : public WritableFile {
     struct io_uring_cqe* cqe;
     int ret;
     sqe = io_uring_get_sqe(&ring);
+    // sqe_count++;
     if (!sqe) {
+      printf("sqe_count = %d\n", sqe_count);
       io_uring_queue_exit(&ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
@@ -461,14 +508,29 @@ class PosixWritableFile final : public WritableFile {
     // Set up the write operation
     // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
-    // Submit the write operation
     io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
     ret = io_uring_submit_and_wait(&ring, 1);
-    if (ret < 0) {
-      io_uring_queue_exit(&ring);
-      return PosixError("io_uring_submit failed", -ret);
-    }
-
+    // ret = io_uring_submit(&ring);
+    // if (ret < 0) {
+    //   io_uring_queue_exit(&ring);
+    //   return PosixError("io_uring_submit failed", -ret);
+    // }
+    // if (sqe_count >= 1) {
+    //   ret = io_uring_submit(&ring);
+    //   if (ret < 0) {
+    //     io_uring_queue_exit(&ring);
+    //     return PosixError("io_uring_submit failed", -ret);
+    //   }
+    //   for (int i = 0; i < ret; i++) {
+    //     int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+    //     if (ret_cqe < 0) {
+    //       io_uring_queue_exit(&ring);
+    //       return PosixError("io_uring_wait_cqe failed", -ret);
+    //     }
+    //     io_uring_cqe_seen(&ring, cqe);
+    //   }
+    //   sqe_count = 0;
+    // }
     // Wait for the completion of the write operation
     // ret = io_uring_wait_cqe(&ring, &cqe);
     // if (ret < 0) {
@@ -564,26 +626,26 @@ class PosixWritableFile final : public WritableFile {
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
     io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
-    // int ret = io_uring_submit(ring);
-    // if (ret <= 0) {
-    //   printf("Submition failed of fsync !\n");
-    // }
-    int ret = io_uring_submit_and_wait(ring, 1);
-    if (ret < 0) {
-      io_uring_queue_exit(ring);
-      return PosixError("io_uring_submit failed", -ret);
+    int ret = io_uring_submit(ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
     }
-
-    // for (int i = 0; i < ret; i++) {
-    //   ret = io_uring_wait_cqe(ring, &cqe);
-    //   if (ret) {
-    //     fprintf(stderr, "wait_cqe %d\n", ret);
-    //     return PosixError("wait_cqe", errno);
-    //   }
-
-    //   io_uring_cqe_seen(ring, cqe);
+    // int ret = io_uring_submit_and_wait(ring, 1);
+    // if (ret < 0) {
+    //   io_uring_queue_exit(ring);
+    //   return PosixError("io_uring_submit failed", -ret);
     // }
-    io_uring_cq_advance(ring, 1);
+
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(ring, cqe);
+    }
+    // io_uring_cq_advance(ring, 1);
     return Status::OK();
 #else
     bool sync_success = ::fsync(fd) == 0;
@@ -639,7 +701,7 @@ class PosixWritableFile final : public WritableFile {
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
-  int writes;
+  int sqe_count;
   struct io_uring ring;
 };
 
@@ -724,10 +786,10 @@ class PosixEnv : public Env {
       return PosixError(filename, errno);
     }
 
-    // if (!mmap_limiter_.Acquire()) {
+    if (!mmap_limiter_.Acquire()) {
       *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
       return Status::OK();
-    // }
+    }
 
     uint64_t file_size;
     Status status = GetFileSize(filename, &file_size);
