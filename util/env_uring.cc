@@ -461,7 +461,7 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Set up the write operation
-    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     // Submit the write operation
     // io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
     ret = io_uring_submit_and_wait(&ring, 1);
