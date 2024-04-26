@@ -192,6 +192,7 @@ Status DBImpl::NewDB() {
     return s;
   }
   {
+    
     log::Writer log(file);
     std::string record;
     new_db.EncodeTo(&record);

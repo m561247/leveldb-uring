@@ -227,8 +227,8 @@ endif (WIN32)
 # MemEnv is not part of the interface and could be pulled to a separate library.
 target_sources(leveldb
   PRIVATE
-    "helpers/memenv/memenv.cc"
-    "helpers/memenv/memenv.h"
+     "helpers/memenv/memenv.cc"
+     "helpers/memenv/memenv.h"
 )
 
 target_include_directories(leveldb

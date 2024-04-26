@@ -8,11 +8,6 @@
 #ifndef __Fuchsia__
 #include <sys/resource.h>
 #endif
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -20,23 +15,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <liburing.h>
 #include <limits>
 #include <queue>
 #include <set>
 #include <string>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
-#include <liburing.h>
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
-#include <iostream>
 
 namespace leveldb {
 
@@ -59,7 +59,9 @@ constexpr const int kOpenBaseFlags = 0;
 #endif  // defined(HAVE_O_CLOEXEC)
 
 constexpr const size_t kWritableFileBufferSize = 65536;
-
+#define QUEUE_DEPTH 512
+#define HAVE_FDATASYNC 0
+#define HAVE_FSYNC 0
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
     return Status::NotFound(context, std::strerror(error_number));
@@ -191,7 +193,6 @@ class PosixRandomAccessFile final : public RandomAccessFile {
   }
 
   ~PosixRandomAccessFile() override {
-
     if (has_permanent_fd_) {
       assert(fd_ != -1);
       ::close(fd_);
@@ -284,13 +285,22 @@ class PosixWritableFile final : public WritableFile {
         fd_(fd),
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
-        dirname_(Dirname(filename_)) {}
+        dirname_(Dirname(filename_)),
+        sqe_count(0) {
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
+      // Handle initialization failure
+      // You might want to throw an exception or set an error flag
+      printf("Failed to initialize io_uring");
+    }
+  }
 
   ~PosixWritableFile() override {
     if (fd_ >= 0) {
       // Ignoring any potential errors
       Close();
     }
+    io_uring_queue_exit(&ring);
   }
 
   Status Append(const Slice& data) override {
@@ -308,22 +318,22 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Can't fit in buffer, so need to do at least one write.
-    Status status = FlushBuffer();
-    if (!status.ok()) {
-      return status;
-    }
+    // Status status = FlushBuffer();
+    // if (!status.ok()) {
+    //   return status;
+    // }
 
-    // Small writes go to buffer, large writes are written directly.
-    if (write_size < kWritableFileBufferSize) {
-      std::memcpy(buf_, write_data, write_size);
-      pos_ = write_size;
-      return Status::OK();
-    }
-    return WriteUnbuffered(write_data, write_size);
+    // // Small writes go to buffer, large writes are written directly.
+    // if (write_size < kWritableFileBufferSize) {
+    //   std::memcpy(buf_, write_data, write_size);
+    //   pos_ = write_size;
+    //   return Status::OK();
+    // }
+    // return WriteUnbuffered(write_data, write_size);
   }
 
   Status Close() override {
-	  Status status = FlushBuffer();
+    Status status = FlushBuffer();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -332,6 +342,7 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
+  // Status Flush() override { return Status::OK(); }
   Status Flush() override { return FlushBuffer(); }
 
   Status Sync() override {
@@ -350,16 +361,104 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
 
-    return SyncFd(fd_, filename_);
+    return SyncFd(fd_, filename_, &ring);
+  }
+  Status AsyncFlush() override {
+    if (pos_ == 0) return Status::OK();
+    struct iovec iov = {
+        .iov_base = (void*)buf_,  // Cast to void* because iovec expects it
+        .iov_len = pos_};
+
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    int ret;
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      io_uring_queue_exit(&ring);
+      return PosixError("Failed to get submission queue entry", errno);
+    }
+    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    pos_ = 0;
+    return Status::OK();
+  }
+
+  Status SyncFlush() override {
+    if (sqe_count >= 1) {
+      struct io_uring_sqe* sqe;
+      struct io_uring_cqe* cqe;
+      int submit_ret = io_uring_submit(&ring);
+      if (submit_ret <= 0) {
+        printf("Submition failed of fsync !\n");
+      }
+      for (int i = 0; i < submit_ret; i++) {
+        int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+        if (ret_cqe) {
+          fprintf(stderr, "wait_cqe %d\n", ret_cqe);
+          return PosixError("wait_cqe", errno);
+        }
+
+        io_uring_cqe_seen(&ring, cqe);
+      }
+      sqe_count = 0;
+      return Status::OK();
+    }
+    return Status::OK();
   }
 
  private:
+  bool IsLdbFile(const std::string& f) {
+    return strstr(f.c_str(), ".ldb") != nullptr;
+  }
+
+  bool IsLogFile(const std::string& f) {
+    return strstr(f.c_str(), ".log") != nullptr;
+  }
   Status FlushBuffer() {
-    Status status = WriteUnbuffered(buf_, pos_);
+    Status status;
+    // if (IsLogFile(filename_) || IsLdbFile(filename_)) {
+    if (IsLdbFile(filename_)) {
+      status = AsyncWriteUnbuffered(buf_, pos_);
+    } else {
+      status = WriteUnbuffered(buf_, pos_);
+    }
     pos_ = 0;
     return status;
   }
+  Status AsyncWriteUnbuffered(const char* data, size_t size) {
+    if (size == 0) return Status::OK();
+    // struct iovec iov = {
+    //     .iov_base = (void*)data,  // Cast to void* because iovec expects it
+    //     .iov_len = size};
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    int ret;
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      io_uring_queue_exit(&ring);
+      return PosixError("Failed to get submission queue entry", errno);
+    }
+    // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+     io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
+    
+    sqe_count++;
+    if (sqe_count >= 1) {
+      int submit_ret = io_uring_submit(&ring);
+      if (submit_ret <= 0) {
+        printf("Submition failed of fsync !\n");
+      }
+      for (int i = 0; i < submit_ret; i++) {
+        int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+        if (ret_cqe) {
+          fprintf(stderr, "wait_cqe %d\n", ret);
+          return PosixError("wait_cqe", errno);
+        }
 
+        io_uring_cqe_seen(&ring, cqe);
+      }
+      sqe_count = 0;
+    }
+    return Status::OK();
+  }
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
       ssize_t write_result = ::write(fd_, data, size);
@@ -385,19 +484,19 @@ class PosixWritableFile final : public WritableFile {
     if (fd < 0) {
       status = PosixError(dirname_, errno);
     } else {
-      status = SyncFd(fd, dirname_);
+      status = SyncFd(fd, dirname_, &ring);
       ::close(fd);
     }
     return status;
   }
-
   // Ensures that all the caches associated with the given file descriptor's
   // data are flushed all the way to durable media, and can withstand power
   // failures.
   //
   // The path argument is only used to populate the description string in the
   // returned Status if an error occurs.
-  static Status SyncFd(int fd, const std::string& fd_path) {
+  static Status SyncFd(int fd, const std::string& fd_path,
+                       struct io_uring* ring) {
 #if HAVE_FULLFSYNC
     // On macOS and iOS, fsync() doesn't guarantee durability past power
     // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
@@ -410,14 +509,45 @@ class PosixWritableFile final : public WritableFile {
 
 #if HAVE_FDATASYNC
     bool sync_success = ::fdatasync(fd) == 0;
-#else
-    bool sync_success = ::fsync(fd) == 0;
-#endif  // HAVE_FDATASYNC
-
     if (sync_success) {
       return Status::OK();
     }
     return PosixError(fd_path, errno);
+
+#elif HAVE_FSYNC
+    bool sync_success = ::fsync(fd) == 0;
+    if (sync_success) {
+      return Status::OK();
+    }
+    return PosixError(fd_path, errno);
+
+#else  // io_uring fsync
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+      return PosixError("Failed to get SQE", errno);
+    }
+    io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+
+    io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+    int ret = io_uring_submit(ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
+    }
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(ring, cqe);
+    }
+    // io_uring_cq_advance(ring, 1);
+    return Status::OK();
+
+#endif  // HAVE_FDATASYNC
   }
 
   // Returns the directory name in a path pointing to a file.
@@ -461,10 +591,12 @@ class PosixWritableFile final : public WritableFile {
   char buf_[kWritableFileBufferSize];
   size_t pos_;
   int fd_;
+  int sqe_count;
 
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
+  struct io_uring ring;
 };
 
 int LockOrUnlock(int fd, bool lock) {
@@ -626,7 +758,6 @@ class PosixEnv : public Env {
   }
 
   Status CreateDir(const std::string& dirname) override {
-    std::cout << dirname.c_str() << std::endl;
     if (::mkdir(dirname.c_str(), 0755) != 0) {
       return PosixError(dirname, errno);
     }
@@ -651,7 +782,6 @@ class PosixEnv : public Env {
   }
 
   Status RenameFile(const std::string& from, const std::string& to) override {
-    std::cout << to.c_str() << std::endl;
     if (std::rename(from.c_str(), to.c_str()) != 0) {
       return PosixError(from, errno);
     }
@@ -708,7 +838,7 @@ class PosixEnv : public Env {
       *result = env;
     } else {
       char buf[100];
-      std::snprintf(buf, sizeof(buf), "/tmp/leveldbtest-%d",
+      std::snprintf(buf, sizeof(buf), "/mnt/leveldb/leveldbtest-%d",
                     static_cast<int>(::geteuid()));
       *result = buf;
     }

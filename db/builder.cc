@@ -37,12 +37,16 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       key = iter->key();
       builder->Add(key, iter->value());
     }
+    // sync write
+    // file->SyncFlush();
+
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);
     }
 
     // Finish and check for builder errors
     s = builder->Finish();
+    
     if (s.ok()) {
       meta->file_size = builder->FileSize();
       assert(meta->file_size > 0);
