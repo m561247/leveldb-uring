@@ -22,6 +22,8 @@ class StdoutPrinter : public WritableFile {
   Status Sync() override { return Status::OK(); }
   Status AsyncFlush() override { return Status::OK(); }
   Status SyncFlush() override { return Status::OK(); }
+  Status AsyncSync() override { return Status::OK(); }
+  Status AsyncClose() override { return Status::OK(); }
 };
 
 bool HandleDumpCommand(Env* env, char** files, int num) {

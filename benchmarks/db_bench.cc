@@ -47,9 +47,9 @@
 static const char* FLAGS_benchmarks =
     "fillseq,"
     "fillsync,"
-    "fillrandom,"
+    // "fillrandom,"
     // "overwrite,"
-    // "readrandom,"
+    "readrandom,"
     // "readrandom,"  // Extra run to allow previous compactions to quiesce
     // "readseq,"
     // "readreverse,"
@@ -57,7 +57,7 @@ static const char* FLAGS_benchmarks =
     // "readrandom,"
     // "readseq,"
     // "readreverse,"
-    "fill100K,"
+    // "fill100K,"
     // "crc32c,"
     // "snappycomp,"
     // "snappyuncomp,"
@@ -75,7 +75,7 @@ static int FLAGS_reads = -1;
 static int FLAGS_threads = 1;
 
 // Size of each value
-static int FLAGS_value_size = 100;
+static int FLAGS_value_size = 2048;
 
 // Arrange to generate values that shrink to this fraction of
 // their original size after compression

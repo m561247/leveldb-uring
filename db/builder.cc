@@ -37,8 +37,6 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       key = iter->key();
       builder->Add(key, iter->value());
     }
-    // sync write
-    // file->SyncFlush();
 
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);
@@ -55,10 +53,11 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
     // Finish and check for file errors
     if (s.ok()) {
-      s = file->Sync();
+      // s = file->Sync();
+      s = file->AsyncSync();
     }
     if (s.ok()) {
-      s = file->Close();
+      s = file->AsyncClose();
     }
     delete file;
     file = nullptr;

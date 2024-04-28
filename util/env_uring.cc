@@ -59,7 +59,7 @@ constexpr const int kOpenBaseFlags = 0;
 #endif  // defined(HAVE_O_CLOEXEC)
 
 constexpr const size_t kWritableFileBufferSize = 65536;
-#define QUEUE_DEPTH 512
+#define QUEUE_DEPTH 5120
 #define HAVE_FDATASYNC 0
 #define HAVE_FSYNC 0
 Status PosixError(const std::string& context, int error_number) {
@@ -334,6 +334,7 @@ class PosixWritableFile final : public WritableFile {
 
   Status Close() override {
     Status status = FlushBuffer();
+    status = SyncFlush();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -360,35 +361,34 @@ class PosixWritableFile final : public WritableFile {
     if (!status.ok()) {
       return status;
     }
-
-    return SyncFd(fd_, filename_, &ring);
+    status = SyncFd(fd_, filename_, &ring);
+    sqe_count = 0;
+    return status;
   }
   Status AsyncFlush() override {
-    if (pos_ == 0) return Status::OK();
-    struct iovec iov = {
-        .iov_base = (void*)buf_,  // Cast to void* because iovec expects it
-        .iov_len = pos_};
-
-    struct io_uring_sqe* sqe;
-    struct io_uring_cqe* cqe;
-    int ret;
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-      io_uring_queue_exit(&ring);
-      return PosixError("Failed to get submission queue entry", errno);
-    }
-    io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    Status status;
+    sqe_count++;
+    status = AsyncWriteUnbuffered(buf_, pos_);
     pos_ = 0;
-    return Status::OK();
+    return status;
   }
 
   Status SyncFlush() override {
-    if (sqe_count >= 1) {
+    if (pos_ != 0) {
       struct io_uring_sqe* sqe;
       struct io_uring_cqe* cqe;
+      int ret;
+      sqe = io_uring_get_sqe(&ring);
+      if (!sqe) {
+        io_uring_queue_exit(&ring);
+        return PosixError("Failed to get submission queue entry", errno);
+      }
+      // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+      io_uring_prep_write(sqe, fd_, (void*)buf_, pos_, -1);
+
       int submit_ret = io_uring_submit(&ring);
       if (submit_ret <= 0) {
-        printf("Submition failed of fsync !\n");
+        printf("Submition failed of SyncFlush !\n");
       }
       for (int i = 0; i < submit_ret; i++) {
         int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
@@ -399,10 +399,25 @@ class PosixWritableFile final : public WritableFile {
 
         io_uring_cqe_seen(&ring, cqe);
       }
-      sqe_count = 0;
+
       return Status::OK();
     }
     return Status::OK();
+  }
+  Status AsyncSync() override {
+    Status status = AsyncFd(fd_, filename_, &ring);
+    sqe_count = 0;
+    return status;
+  }
+
+  Status AsyncClose() override {
+    Status status = SyncFlush();
+    const int close_result = ::close(fd_);
+    if (close_result < 0 && status.ok()) {
+      status = PosixError(filename_, errno);
+    }
+    fd_ = -1;
+    return status;
   }
 
  private:
@@ -415,12 +430,7 @@ class PosixWritableFile final : public WritableFile {
   }
   Status FlushBuffer() {
     Status status;
-    // if (IsLogFile(filename_) || IsLdbFile(filename_)) {
-    if (IsLdbFile(filename_)) {
-      status = AsyncWriteUnbuffered(buf_, pos_);
-    } else {
-      status = WriteUnbuffered(buf_, pos_);
-    }
+    status = WriteUnbuffered(buf_, pos_);
     pos_ = 0;
     return status;
   }
@@ -438,10 +448,8 @@ class PosixWritableFile final : public WritableFile {
       return PosixError("Failed to get submission queue entry", errno);
     }
     // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
-     io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
-    
-    sqe_count++;
-    if (sqe_count >= 1) {
+    io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
+    if (sqe_count >= 512) {
       int submit_ret = io_uring_submit(&ring);
       if (submit_ret <= 0) {
         printf("Submition failed of fsync !\n");
@@ -459,6 +467,7 @@ class PosixWritableFile final : public WritableFile {
     }
     return Status::OK();
   }
+
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
       ssize_t write_result = ::write(fd_, data, size);
@@ -488,6 +497,34 @@ class PosixWritableFile final : public WritableFile {
       ::close(fd);
     }
     return status;
+  }
+  static Status AsyncFd(int fd, const std::string& fd_path,
+                        struct io_uring* ring) {
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+      return PosixError("Failed to get SQE", errno);
+    }
+    io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+
+    io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+    int ret = io_uring_submit(ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
+    }
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(ring, cqe);
+    }
+
+    // io_uring_cq_advance(ring, 1);
+    return Status::OK();
   }
   // Ensures that all the caches associated with the given file descriptor's
   // data are flushed all the way to durable media, and can withstand power
@@ -544,6 +581,7 @@ class PosixWritableFile final : public WritableFile {
 
       io_uring_cqe_seen(ring, cqe);
     }
+
     // io_uring_cq_advance(ring, 1);
     return Status::OK();
 
