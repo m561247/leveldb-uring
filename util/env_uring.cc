@@ -365,11 +365,7 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
   Status AsyncFlush() override {
-    Status status;
-    sqe_count++;
-    status = AsyncWriteUnbuffered(buf_, pos_);
-    pos_ = 0;
-    return status;
+    return AsyncFlushBuffer();
   }
 
   Status SyncFlush() override {
@@ -435,6 +431,14 @@ class PosixWritableFile final : public WritableFile {
     pos_ = 0;
     return status;
   }
+  
+  Status AsyncFlushBuffer() {
+    Status status;
+    status = AsyncWriteUnbuffered(buf_, pos_);
+    pos_ = 0;
+    return status;
+  }
+
    Status AsyncWriteUnbuffered(const char* data, size_t size) {    
     if (size == 0) return Status::OK();
     // struct iovec iov = {
