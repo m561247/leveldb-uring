@@ -334,7 +334,6 @@ class PosixWritableFile final : public WritableFile {
 
   Status Close() override {
     Status status = FlushBuffer();
-    status = SyncFlush();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -399,13 +398,15 @@ class PosixWritableFile final : public WritableFile {
 
         io_uring_cqe_seen(&ring, cqe);
       }
-
+      pos_ = 0;
       return Status::OK();
     }
     return Status::OK();
   }
   Status AsyncSync() override {
-    Status status = AsyncFd(fd_, filename_, &ring);
+    // flush pos_
+    Status status = AsyncFlush();
+    status = AsyncFd(fd_, filename_, &ring);
     sqe_count = 0;
     return status;
   }
@@ -434,7 +435,7 @@ class PosixWritableFile final : public WritableFile {
     pos_ = 0;
     return status;
   }
-  Status AsyncWriteUnbuffered(const char* data, size_t size) {
+   Status AsyncWriteUnbuffered(const char* data, size_t size) {    
     if (size == 0) return Status::OK();
     // struct iovec iov = {
     //     .iov_base = (void*)data,  // Cast to void* because iovec expects it
