@@ -342,8 +342,8 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-  Status Flush() override { return Status::OK(); }
-  // Status Flush() override { return FlushBuffer(); }
+  // Status Flush() override { return Status::OK(); }
+  Status Flush() override { return FlushBuffer(); }
 
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
