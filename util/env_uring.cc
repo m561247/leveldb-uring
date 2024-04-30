@@ -318,18 +318,18 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Can't fit in buffer, so need to do at least one write.
-    // Status status = FlushBuffer();
-    // if (!status.ok()) {
-    //   return status;
-    // }
+    Status status = FlushBuffer();
+    if (!status.ok()) {
+      return status;
+    }
 
-    // // Small writes go to buffer, large writes are written directly.
-    // if (write_size < kWritableFileBufferSize) {
-    //   std::memcpy(buf_, write_data, write_size);
-    //   pos_ = write_size;
-    //   return Status::OK();
-    // }
-    // return WriteUnbuffered(write_data, write_size);
+    // Small writes go to buffer, large writes are written directly.
+    if (write_size < kWritableFileBufferSize) {
+      std::memcpy(buf_, write_data, write_size);
+      pos_ = write_size;
+      return Status::OK();
+    }
+    return WriteUnbuffered(write_data, write_size);
   }
 
   Status Close() override {
@@ -342,8 +342,8 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-  // Status Flush() override { return Status::OK(); }
-  Status Flush() override { return FlushBuffer(); }
+  Status Flush() override { return Status::OK(); }
+  // Status Flush() override { return FlushBuffer(); }
 
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
@@ -366,6 +366,7 @@ class PosixWritableFile final : public WritableFile {
   }
   Status AsyncFlush() override {
     return AsyncFlushBuffer();
+    // return Status::OK();
   }
 
   Status SyncFlush() override {
@@ -454,22 +455,22 @@ class PosixWritableFile final : public WritableFile {
     }
     // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
-    if (sqe_count >= 512) {
-      int submit_ret = io_uring_submit(&ring);
-      if (submit_ret <= 0) {
-        printf("Submition failed of fsync !\n");
-      }
-      for (int i = 0; i < submit_ret; i++) {
-        int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
-        if (ret_cqe) {
-          fprintf(stderr, "wait_cqe %d\n", ret);
-          return PosixError("wait_cqe", errno);
-        }
+    // if (sqe_count >= 512) {
+    //   int submit_ret = io_uring_submit(&ring);
+    //   if (submit_ret <= 0) {
+    //     printf("Submition failed of fsync !\n");
+    //   }
+    //   for (int i = 0; i < submit_ret; i++) {
+    //     int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+    //     if (ret_cqe) {
+    //       fprintf(stderr, "wait_cqe %d\n", ret);
+    //       return PosixError("wait_cqe", errno);
+    //     }
 
-        io_uring_cqe_seen(&ring, cqe);
-      }
-      sqe_count = 0;
-    }
+    //     io_uring_cqe_seen(&ring, cqe);
+    //   }
+    //   sqe_count = 0;
+    // }
     return Status::OK();
   }
 
