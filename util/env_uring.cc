@@ -60,7 +60,7 @@ constexpr const int kOpenBaseFlags = 0;
 
 constexpr const size_t kWritableFileBufferSize = 65536;
 #define QUEUE_DEPTH 5120
-#define HAVE_FDATASYNC 0
+#define HAVE_FDATASYNC 1
 #define HAVE_FSYNC 0
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
@@ -318,18 +318,18 @@ class PosixWritableFile final : public WritableFile {
     }
 
     // Can't fit in buffer, so need to do at least one write.
-    Status status = FlushBuffer();
-    if (!status.ok()) {
-      return status;
-    }
+    // Status status = FlushBuffer();
+    // if (!status.ok()) {
+    //   return status;
+    // }
 
-    // Small writes go to buffer, large writes are written directly.
-    if (write_size < kWritableFileBufferSize) {
-      std::memcpy(buf_, write_data, write_size);
-      pos_ = write_size;
-      return Status::OK();
-    }
-    return WriteUnbuffered(write_data, write_size);
+    // // Small writes go to buffer, large writes are written directly.
+    // if (write_size < kWritableFileBufferSize) {
+    //   std::memcpy(buf_, write_data, write_size);
+    //   pos_ = write_size;
+    //   return Status::OK();
+    // }
+    // return WriteUnbuffered(write_data, write_size);
   }
 
   Status Close() override {
@@ -345,6 +345,11 @@ class PosixWritableFile final : public WritableFile {
   // Status Flush() override { return Status::OK(); }
   Status Flush() override { return FlushBuffer(); }
 
+  
+  Status AsyncFlush() override {
+    // return AsyncFlushBuffer();
+    return Status::OK();
+  }
   Status Sync() override {
     // Ensure new files referred to by the manifest are in the filesystem.
     //
@@ -364,13 +369,21 @@ class PosixWritableFile final : public WritableFile {
     sqe_count = 0;
     return status;
   }
-  Status AsyncFlush() override {
-    return AsyncFlushBuffer();
-    // return Status::OK();
+
+  Status AsyncSync() override {
+    // flush pos_
+    Status status = AsyncFlushBuffer();
+    status = AsyncFd(fd_, filename_, &ring);
+    sqe_count = 0;
+    return status;
   }
+
 
   Status SyncFlush() override {
     if (pos_ != 0) {
+      struct iovec iov = {
+          .iov_base = (void*)buf_,  // Cast to void* because iovec expects it
+          .iov_len = pos_};
       struct io_uring_sqe* sqe;
       struct io_uring_cqe* cqe;
       int ret;
@@ -400,13 +413,6 @@ class PosixWritableFile final : public WritableFile {
     }
     return Status::OK();
   }
-  Status AsyncSync() override {
-    // flush pos_
-    Status status = AsyncFlush();
-    status = AsyncFd(fd_, filename_, &ring);
-    sqe_count = 0;
-    return status;
-  }
 
   Status AsyncClose() override {
     Status status = SyncFlush();
@@ -432,7 +438,7 @@ class PosixWritableFile final : public WritableFile {
     pos_ = 0;
     return status;
   }
-  
+
   Status AsyncFlushBuffer() {
     Status status;
     status = AsyncWriteUnbuffered(buf_, pos_);
@@ -440,7 +446,7 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
 
-   Status AsyncWriteUnbuffered(const char* data, size_t size) {    
+  Status AsyncWriteUnbuffered(const char* data, size_t size) {
     if (size == 0) return Status::OK();
     // struct iovec iov = {
     //     .iov_base = (void*)data,  // Cast to void* because iovec expects it

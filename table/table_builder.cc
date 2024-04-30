@@ -131,8 +131,8 @@ void TableBuilder::Flush() {
   WriteBlock(&r->data_block, &r->pending_handle);
   if (ok()) {
     r->pending_index_entry = true;
-    // r->status = r->file->Flush();
-    r->status = r->file->AsyncFlush();
+    r->status = r->file->Flush();
+    // r->status = r->file->AsyncFlush();
   }
   if (r->filter_block != nullptr) {
     r->filter_block->StartBlock(r->offset);
