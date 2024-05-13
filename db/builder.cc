@@ -53,12 +53,9 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
     // Finish and check for file errors
     if (s.ok()) {
-      // 3272231, 3272245
       s = file->Sync();
-      // s = file->AsyncSync();
     }
     if (s.ok()) {
-      // s = file->AsyncClose();
       s = file->Close();
     }
     delete file;

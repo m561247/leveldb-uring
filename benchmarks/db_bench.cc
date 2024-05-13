@@ -45,9 +45,9 @@
 //      sstables    -- Print sstable info
 //      heapprofile -- Dump a heap profile (if supported by this port)
 static const char* FLAGS_benchmarks =
-    "fillseq,"
+    // "fillseq,"
     // "fillsync,"
-    "fillrandom,"
+    // "fillrandom,"
     // "overwrite,"
     // "readrandom,"
     // "readrandom,"  // Extra run to allow previous compactions to quiesce
@@ -57,7 +57,7 @@ static const char* FLAGS_benchmarks =
     // "readrandom,"
     // "readseq,"
     // "readreverse,"
-    // "fill100K,"
+    "fill100K,"
     // "crc32c,"
     // "snappycomp,"
     // "snappyuncomp,"

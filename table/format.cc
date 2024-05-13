@@ -102,7 +102,7 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
     }
   }
   // 4136 fail
-  std::cout << "data[n] " << n << " is: " << data[n] << std::endl;
+  // std::cout << "data[n] " << n << " is: " << data[n] << std::endl;
   switch (data[n]) {
     case kNoCompression:
       if (data != buf) {
