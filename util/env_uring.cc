@@ -40,6 +40,7 @@
 #define HAVE_FSYNC 0
 #define HAVE_FDATASYNC 0
 #define QUEUE_DEPTH 512
+#define URING_READ 0
 namespace leveldb {
 
 namespace {
@@ -202,7 +203,7 @@ class PosixRandomAccessFile final : public RandomAccessFile {
   }
 
   Status Read(uint64_t offset, size_t n, Slice* result,
-              char* scratch) const override {
+              char* scratch) override {
     int fd = fd_;
     if (!has_permanent_fd_) {
       fd = ::open(filename_.c_str(), O_RDONLY | kOpenBaseFlags);
@@ -235,6 +236,101 @@ class PosixRandomAccessFile final : public RandomAccessFile {
   const std::string filename_;
 };
 
+class UringRandomAccessFile final : public RandomAccessFile {
+ public:
+  // The new instance takes ownership of |fd|. |fd_limiter| must outlive this
+  // instance, and will be used to determine if .
+  UringRandomAccessFile(std::string filename, int fd, Limiter* fd_limiter)
+      : has_permanent_fd_(fd_limiter->Acquire()),
+        fd_(has_permanent_fd_ ? fd : -1),
+        fd_limiter_(fd_limiter),
+        filename_(std::move(filename)) {
+    if (!has_permanent_fd_) {
+      assert(fd_ == -1);
+      ::close(fd);  // The file will be opened on every read.
+    }
+    // memset(&params, 0, sizeof(params));
+    // params.flags |= IORING_SETUP_SQPOLL;
+    // params.sq_thread_idle = 20000;
+    // int ret = io_uring_queue_init_params(8, &ring, &params);
+
+    int ret = io_uring_queue_init(8, &ring, 0);
+    if (ret < 0) {
+      // Handle initialization failure
+      // You might want to throw an exception or set an error flag
+      printf("Failed to initialize io_uring");
+    }
+  }
+
+  ~UringRandomAccessFile() override {
+    if (has_permanent_fd_) {
+      assert(fd_ != -1);
+      ::close(fd_);
+      fd_limiter_->Release();
+    }
+    io_uring_queue_exit(&ring);
+  }
+
+  Status Read(uint64_t offset, size_t n, Slice* result,
+              char* scratch) override {
+    int fd = fd_;
+    if (!has_permanent_fd_) {
+      fd = ::open(filename_.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) {
+        return PosixError(filename_, errno);
+      }
+    }
+    assert(fd != -1);
+
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+
+    Status status;
+    struct iovec iov;
+    iov.iov_base = scratch;  // Data buffer
+    iov.iov_len = n;
+    sqe = io_uring_get_sqe(&ring);
+    // sqe->flags |= IOSQE_FIXED_FILE;
+
+    if (!sqe) {
+      io_uring_queue_exit(&ring);
+      return PosixError("Failed to get submission queue entry", errno);
+    }
+    io_uring_prep_readv(sqe, fd, &iov, 1, offset);
+    // io_uring_prep_read(sqe, fd, scratch, n, offset);
+    int ret = io_uring_submit(&ring);
+
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret) {
+      fprintf(stderr, "wait_cqe %d\n", ret);
+      return PosixError("wait_cqe", errno);
+    }
+    ssize_t read_size = cqe->res;
+
+    io_uring_cqe_seen(&ring, cqe);
+
+    *result = Slice(scratch, (read_size < 0) ? 0 : read_size);
+    if (read_size < 0) {
+      // An error: return a non-ok status.
+      status = PosixError(filename_, errno);
+    }
+    if (!has_permanent_fd_) {
+      // Close the temporary file descriptor opened earlier.
+      assert(fd != fd_);
+      ::close(fd);
+    }
+    return status;
+  }
+
+ private:
+  const bool has_permanent_fd_;  // If false, the file is opened on every read.
+  const int fd_;                 // -1 if has_permanent_fd_ is false.
+  Limiter* const fd_limiter_;
+  const std::string filename_;
+  struct io_uring ring;
+  struct io_uring_params params;
+};
+
 // Implements random read access in a file using mmap().
 //
 // Instances of this class are thread-safe, as required by the RandomAccessFile
@@ -262,7 +358,7 @@ class PosixMmapReadableFile final : public RandomAccessFile {
   }
 
   Status Read(uint64_t offset, size_t n, Slice* result,
-              char* scratch) const override {
+              char* scratch) override {
     if (offset + n > length_) {
       *result = Slice();
       return PosixError(filename_, EINVAL);
@@ -287,7 +383,13 @@ class PosixWritableFile final : public WritableFile {
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
         dirname_(Dirname(filename_)) {
-    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    // memset(&params, 0, sizeof(params));
+    // params.flags |= IORING_SETUP_SQPOLL;
+    // params.flags |= IORING_SETUP_SQE128;
+    // params.sq_thread_idle = 20000;
+    // int ret = io_uring_queue_init_params(8, &ring, &params);
+
+    int ret = io_uring_queue_init(8, &ring, 0);
     if (ret < 0) {
       // Handle initialization failure
       // You might want to throw an exception or set an error flag
@@ -333,7 +435,8 @@ class PosixWritableFile final : public WritableFile {
   }
 
   Status Close() override {
-    Status status = FlushBuffer();
+    // Status status = FlushBuffer();
+    Status status = AsyncFlushBuffer();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -358,6 +461,7 @@ class PosixWritableFile final : public WritableFile {
     }
 
     status = AsyncFlushBuffer();
+    // status = FlushBuffer();
     if (!status.ok()) {
       return status;
     }
@@ -378,22 +482,44 @@ class PosixWritableFile final : public WritableFile {
   }
   Status AsyncWriteUnbuffered(const char* data, size_t size) {
     if (size == 0) return Status::OK();
-    // struct iovec iov = {
-    //     .iov_base = (void*)data,  // Cast to void* because iovec expects it
-    //     .iov_len = size};
+    struct iovec iov = {
+        .iov_base = (void*)data,  // Cast to void* because iovec expects it
+        .iov_len = size};
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
     int ret;
+    // ret = io_uring_register_files(ring, fd_, 1);
     sqe = io_uring_get_sqe(&ring);
+    // sqe->flags |= IOSQE_ASYNC;
+    // sqe->flags |= IOSQE_FIXED_FILE;
+
     if (!sqe) {
       io_uring_queue_exit(&ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
-    // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
-    io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
+    io_uring_prep_writev(sqe, fd_, &iov, 1, 0);
+    // io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
+    ret = io_uring_submit(&ring);
+    // print_sq_poll_kernel_thread_status();
+    if (ret <= 0) {
+      printf("Submition failed of write !\n");
+    }
+    for (int i = 0; i < ret; i++) {
+      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+      io_uring_cqe_seen(&ring, cqe);
+    }
 
+    // io_uring_cq_advance(&ring, 1);
     return Status::OK();
   }
+
+
+
+
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
       ssize_t write_result = ::write(fd_, data, size);
@@ -529,6 +655,7 @@ class PosixWritableFile final : public WritableFile {
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
   struct io_uring ring;
+  struct io_uring_params params;
 };
 
 int LockOrUnlock(int fd, bool lock) {
@@ -614,6 +741,11 @@ class PosixEnv : public Env {
 
     if (!mmap_limiter_.Acquire()) {
       *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
+      return Status::OK();
+    }
+
+    if (URING_READ) {
+      *result = new UringRandomAccessFile(filename, fd, &fd_limiter_);
       return Status::OK();
     }
 

@@ -189,7 +189,7 @@ class RandomAccessFileImpl : public RandomAccessFile {
   ~RandomAccessFileImpl() override { file_->Unref(); }
 
   Status Read(uint64_t offset, size_t n, Slice* result,
-              char* scratch) const override {
+              char* scratch)  override {
     return file_->Read(offset, n, result, scratch);
   }
 

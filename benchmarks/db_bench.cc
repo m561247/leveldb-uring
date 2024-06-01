@@ -2,11 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include <sys/types.h>
-
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/types.h>
 
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
@@ -14,6 +13,7 @@
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/write_batch.h"
+
 #include "port/port.h"
 #include "util/crc32c.h"
 #include "util/histogram.h"
@@ -45,11 +45,11 @@
 //      sstables    -- Print sstable info
 //      heapprofile -- Dump a heap profile (if supported by this port)
 static const char* FLAGS_benchmarks =
-    // "fillseq,"
-    // "fillsync,"
-    // "fillrandom,"
+    "fillseq,"  // will do read(random when compaction)
+    "fillsync,"
+    "fillrandom," 
     // "overwrite,"
-    // "readrandom,"
+    "readrandom,"
     // "readrandom,"  // Extra run to allow previous compactions to quiesce
     // "readseq,"
     // "readreverse,"
@@ -57,7 +57,7 @@ static const char* FLAGS_benchmarks =
     // "readrandom,"
     // "readseq,"
     // "readreverse,"
-    "fill100K,"
+    // "fill100K,"
     // "crc32c,"
     // "snappycomp,"
     // "snappyuncomp,"
@@ -73,6 +73,7 @@ static int FLAGS_reads = -1;
 
 // Number of concurrent threads to run.
 static int FLAGS_threads = 1;
+static int read_thread = 1;
 
 // Size of each value
 static int FLAGS_value_size = 100;
@@ -596,12 +597,12 @@ class Benchmark {
         method = &Benchmark::WriteRandom;
       } else if (name == Slice("fillsync")) {
         fresh_db = true;
-        num_ /= 1000;
+        num_ /= 50;
         write_options_.sync = true;
-        method = &Benchmark::WriteSeq;
+        method = &Benchmark::WriteRandom;
       } else if (name == Slice("fill100K")) {
         fresh_db = true;
-        num_ /= 100;
+        num_ /= 1000;
         value_size_ = 100 * 1000;
         method = &Benchmark::WriteRandom;
       } else if (name == Slice("readseq")) {
@@ -609,6 +610,7 @@ class Benchmark {
       } else if (name == Slice("readreverse")) {
         method = &Benchmark::ReadReverse;
       } else if (name == Slice("readrandom")) {
+        num_threads = read_thread;
         method = &Benchmark::ReadRandom;
       } else if (name == Slice("readmissing")) {
         method = &Benchmark::ReadMissing;
@@ -857,6 +859,7 @@ class Benchmark {
         bytes += value_size_ + key.slice().size();
         thread->stats.FinishedSingleOp();
       }
+
       s = db_->Write(write_options_, &batch);
       if (!s.ok()) {
         std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());

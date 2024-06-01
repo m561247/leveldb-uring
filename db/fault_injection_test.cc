@@ -96,9 +96,9 @@ struct FileState {
 
   FileState() : pos_(-1), pos_at_last_sync_(-1), pos_at_last_flush_(-1) {}
 
-  bool IsFullySynced() const { return pos_ <= 0 || pos_ == pos_at_last_sync_; }
+  bool IsFully() const { return pos_ <= 0 || pos_ == pos_at_last_sync_; }
 
-  Status DropUnsyncedData() const;
+  Status DropUnData() const;
 };
 
 }  // anonymous namespace
@@ -137,9 +137,9 @@ class FaultInjectionTestEnv : public EnvWrapper {
   Status RenameFile(const std::string& s, const std::string& t) override;
 
   void WritableFileClosed(const FileState& state);
-  Status DropUnsyncedFileData();
+  Status DropUnFileData();
   Status RemoveFilesCreatedAfterLastDirSync();
-  void DirWasSynced();
+  void DirWas();
   bool IsFileCreatedSinceLastDirSync(const std::string& filename);
   void ResetState();
   void UntrackFile(const std::string& f);
@@ -204,7 +204,7 @@ Status TestWritableFile::Flush() {
 Status TestWritableFile::SyncParent() {
   Status s = SyncDir(GetDirName(state_.filename_));
   if (s.ok()) {
-    env_->DirWasSynced();
+    env_->DirWas();
   }
   return s;
 }
@@ -265,7 +265,7 @@ Status FaultInjectionTestEnv::NewAppendableFile(const std::string& fname,
   return s;
 }
 
-Status FaultInjectionTestEnv::DropUnsyncedFileData() {
+Status FaultInjectionTestEnv::DropUnFileData() {
   Status s;
   MutexLock l(&mutex_);
   for (const auto& kvp : db_file_state_) {
@@ -273,14 +273,14 @@ Status FaultInjectionTestEnv::DropUnsyncedFileData() {
       break;
     }
     const FileState& state = kvp.second;
-    if (!state.IsFullySynced()) {
-      s = state.DropUnsyncedData();
+    if (!state.IsFully()) {
+      s = state.DropUnData();
     }
   }
   return s;
 }
 
-void FaultInjectionTestEnv::DirWasSynced() {
+void FaultInjectionTestEnv::DirWas() {
   MutexLock l(&mutex_);
   new_files_since_last_dir_sync_.clear();
 }
@@ -330,7 +330,7 @@ Status FaultInjectionTestEnv::RenameFile(const std::string& s,
 
 void FaultInjectionTestEnv::ResetState() {
   // Since we are not destroying the database, the existing files
-  // should keep their recorded synced/flushed state. Therefore
+  // should keep their recorded /flushed state. Therefore
   // we do not reset db_file_state_ and new_files_since_last_dir_sync_.
   SetFilesystemActive(true);
 }
@@ -356,7 +356,7 @@ void FaultInjectionTestEnv::WritableFileClosed(const FileState& state) {
   db_file_state_[state.filename_] = state;
 }
 
-Status FileState::DropUnsyncedData() const {
+Status FileState::DropUnData() const {
   int64_t sync_pos = pos_at_last_sync_ == -1 ? 0 : pos_at_last_sync_;
   return Truncate(filename_, sync_pos);
 }
@@ -364,7 +364,7 @@ Status FileState::DropUnsyncedData() const {
 class FaultInjectionTest : public testing::Test {
  public:
   enum ExpectedVerifResult { VAL_EXPECT_NO_ERROR, VAL_EXPECT_ERROR };
-  enum ResetMethod { RESET_DROP_UNSYNCED_DATA, RESET_DELETE_UNSYNCED_FILES };
+  enum ResetMethod { RESET_DROP_UN_DATA, RESET_DELETE_UN_FILES };
 
   FaultInjectionTestEnv* env_;
   std::string dbname_;
@@ -473,10 +473,10 @@ class FaultInjectionTest : public testing::Test {
 
   void ResetDBState(ResetMethod reset_method) {
     switch (reset_method) {
-      case RESET_DROP_UNSYNCED_DATA:
-        ASSERT_LEVELDB_OK(env_->DropUnsyncedFileData());
+      case RESET_DROP_UN_DATA:
+        ASSERT_LEVELDB_OK(env_->DropUnFileData());
         break;
-      case RESET_DELETE_UNSYNCED_FILES:
+      case RESET_DELETE_UN_FILES:
         ASSERT_LEVELDB_OK(env_->RemoveFilesCreatedAfterLastDirSync());
         break;
       default:
@@ -519,20 +519,20 @@ class FaultInjectionTest : public testing::Test {
       int num_post_sync = rnd.Uniform(kMaxNumValues);
 
       PartialCompactTestPreFault(num_pre_sync, num_post_sync);
-      PartialCompactTestReopenWithFault(RESET_DROP_UNSYNCED_DATA, num_pre_sync,
+      PartialCompactTestReopenWithFault(RESET_DROP_UN_DATA, num_pre_sync,
                                         num_post_sync);
 
       NoWriteTestPreFault();
-      NoWriteTestReopenWithFault(RESET_DROP_UNSYNCED_DATA);
+      NoWriteTestReopenWithFault(RESET_DROP_UN_DATA);
 
       PartialCompactTestPreFault(num_pre_sync, num_post_sync);
       // No new files created so we expect all values since no files will be
       // dropped.
-      PartialCompactTestReopenWithFault(RESET_DELETE_UNSYNCED_FILES,
+      PartialCompactTestReopenWithFault(RESET_DELETE_UN_FILES,
                                         num_pre_sync + num_post_sync, 0);
 
       NoWriteTestPreFault();
-      NoWriteTestReopenWithFault(RESET_DELETE_UNSYNCED_FILES);
+      NoWriteTestReopenWithFault(RESET_DELETE_UN_FILES);
     }
   }
 };
