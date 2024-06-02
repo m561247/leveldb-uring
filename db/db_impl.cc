@@ -198,7 +198,8 @@ Status DBImpl::NewDB() {
     new_db.EncodeTo(&record);
     s = log.AddRecord(record);
     if (s.ok()) {
-      s = file->Sync();
+      // Async
+      s = file->AsyncSync();
     }
     if (s.ok()) {
       s = file->Close();
@@ -848,7 +849,8 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   // Finish and check for file errors
   if (s.ok()) {
-    s = compact->outfile->Sync();
+    // Async
+    s = compact->outfile->AsyncSync();
   }
   if (s.ok()) {
     s = compact->outfile->Close();
@@ -1231,7 +1233,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
-        status = logfile_->Sync();
+        // Async
+        status = logfile_->AsyncSync();
         if (!status.ok()) {
           sync_error = true;
         }

@@ -435,8 +435,8 @@ class PosixWritableFile final : public WritableFile {
   }
 
   Status Close() override {
-    // Status status = FlushBuffer();
-    Status status = AsyncFlushBuffer();
+    Status status = FlushBuffer();
+    // Status status = AsyncFlushBuffer();
     const int close_result = ::close(fd_);
     if (close_result < 0 && status.ok()) {
       status = PosixError(filename_, errno);
@@ -446,6 +446,8 @@ class PosixWritableFile final : public WritableFile {
   }
 
   Status Flush() override { return Status::OK(); }
+
+  Status AsyncFlush() override { return Status::OK(); }
 
   // Status Flush() override { return FlushBuffer(); }
 
@@ -460,13 +462,23 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
 
-    status = AsyncFlushBuffer();
-    // status = FlushBuffer();
+    // status = AsyncFlushBuffer();
+    status = FlushBuffer();
     if (!status.ok()) {
       return status;
     }
 
     return SyncFd(fd_, filename_, &ring);
+  }
+
+  Status AsyncSync() override {
+    Status status = AsyncFlushBuffer();
+    // status = FlushBuffer();
+    if (!status.ok()) {
+      return status;
+    }
+
+    return AsyncSyncFd(fd_, filename_, &ring);
   }
 
  private:
@@ -504,21 +516,18 @@ class PosixWritableFile final : public WritableFile {
     if (ret <= 0) {
       printf("Submition failed of write !\n");
     }
-    for (int i = 0; i < ret; i++) {
-      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
-      if (ret_cqe) {
-        fprintf(stderr, "wait_cqe %d\n", ret);
-        return PosixError("wait_cqe", errno);
-      }
-      io_uring_cqe_seen(&ring, cqe);
-    }
+    // for (int i = 0; i < ret; i++) {
+    //   int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+    //   if (ret_cqe) {
+    //     fprintf(stderr, "wait_cqe %d\n", ret);
+    //     return PosixError("wait_cqe", errno);
+    //   }
+    //   io_uring_cqe_seen(&ring, cqe);
+    // }
 
     // io_uring_cq_advance(&ring, 1);
     return Status::OK();
   }
-
-
-
 
   Status WriteUnbuffered(const char* data, size_t size) {
     while (size > 0) {
@@ -608,7 +617,33 @@ class PosixWritableFile final : public WritableFile {
     return Status::OK();
 #endif  // HAVE_FDATASYNC
   }
+  static Status AsyncSyncFd(int fd, const std::string& fd_path,
+                            struct io_uring* ring) {
+    struct io_uring_sqe* sqe;
+    struct io_uring_cqe* cqe;
+    sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+      return PosixError("Failed to get SQE", errno);
+    }
+    io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
+    io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+    int ret = io_uring_submit(ring);
+    if (ret <= 0) {
+      printf("Submition failed of fsync !\n");
+    }
+    for (int i = 0; i < 2; i++) {
+      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(ring, cqe);
+    }
+    // io_uring_cq_advance(ring, 2);
+    return Status::OK();
+  }
   // Returns the directory name in a path pointing to a file.
   //
   // Returns "." if the path does not contain any directory separator.
@@ -901,7 +936,7 @@ class PosixEnv : public Env {
     if (env && env[0] != '\0') {
       *result = env;
     } else {
-      char buf[100];
+      char buf[100];  // /mnt/leveldb/
       std::snprintf(buf, sizeof(buf), "/mnt/leveldb/leveldbtest-%d",
                     static_cast<int>(::geteuid()));
       *result = buf;

@@ -53,7 +53,8 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
     // Finish and check for file errors
     if (s.ok()) {
-      s = file->Sync();
+    // Async
+      s = file->AsyncSync();
     }
     if (s.ok()) {
       s = file->Close();
