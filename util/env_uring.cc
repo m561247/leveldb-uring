@@ -39,7 +39,7 @@
 
 #define HAVE_FSYNC 0
 #define HAVE_FDATASYNC 0
-#define QUEUE_DEPTH 512
+#define QUEUE_DEPTH 32
 #define URING_READ 0
 namespace leveldb {
 
@@ -254,7 +254,7 @@ class UringRandomAccessFile final : public RandomAccessFile {
     // params.sq_thread_idle = 20000;
     // int ret = io_uring_queue_init_params(8, &ring, &params);
 
-    int ret = io_uring_queue_init(8, &ring, 0);
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     if (ret < 0) {
       // Handle initialization failure
       // You might want to throw an exception or set an error flag
@@ -382,12 +382,13 @@ class PosixWritableFile final : public WritableFile {
         fd_(fd),
         is_manifest_(IsManifest(filename)),
         filename_(std::move(filename)),
-        dirname_(Dirname(filename_)) {
-    // memset(&params, 0, sizeof(params));
+        dirname_(Dirname(filename_)),
+        async_writes(0) {
+    memset(&params, 0, sizeof(params));
     // params.flags |= IORING_SETUP_SQPOLL;
     // params.flags |= IORING_SETUP_SQE128;
     // params.sq_thread_idle = 20000;
-    // int ret = io_uring_queue_init_params(8, &ring, &params);
+    // int ret = io_uring_queue_init_params(2, &ring, &params);
 
     int ret = io_uring_queue_init(8, &ring, 0);
     if (ret < 0) {
@@ -447,7 +448,7 @@ class PosixWritableFile final : public WritableFile {
 
   Status Flush() override { return Status::OK(); }
 
-  Status AsyncFlush() override { return Status::OK(); }
+  Status AsyncFlush() override { return AsyncFlushBuffer(); }
 
   // Status Flush() override { return FlushBuffer(); }
 
@@ -477,8 +478,9 @@ class PosixWritableFile final : public WritableFile {
     if (!status.ok()) {
       return status;
     }
-
-    return AsyncSyncFd(fd_, filename_, &ring);
+    status = AsyncSyncFd(fd_, filename_, &ring, async_writes);
+    async_writes = 0;
+    return status;
   }
 
  private:
@@ -488,9 +490,31 @@ class PosixWritableFile final : public WritableFile {
     return status;
   }
   Status AsyncFlushBuffer() {
+    if (pos_ != 0) {
+      async_writes++;
+    }
     Status status = AsyncWriteUnbuffered(buf_, pos_);
     pos_ = 0;
+    // if (async_writes >= 256) {
+    //   WaitAsync(async_writes);
+    //   async_writes -= 256;
+    //   if (async_writes <= 0) async_writes = 0;
+    // }
     return status;
+  }
+
+  Status WaitAsync(int async_writes) {
+    struct io_uring_cqe* cqe;
+    for (int i = 0; i < async_writes; i++) {
+      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      if (ret_cqe) {
+        fprintf(stderr, "wait_cqe %d\n", ret_cqe);
+        return PosixError("wait_cqe", errno);
+      }
+
+      io_uring_cqe_seen(&ring, cqe);
+    }
+    return Status::OK();
   }
   Status AsyncWriteUnbuffered(const char* data, size_t size) {
     if (size == 0) return Status::OK();
@@ -509,8 +533,8 @@ class PosixWritableFile final : public WritableFile {
       io_uring_queue_exit(&ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
-    io_uring_prep_writev(sqe, fd_, &iov, 1, 0);
-    // io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
+    // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
+    io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
     ret = io_uring_submit(&ring);
     // print_sq_poll_kernel_thread_status();
     if (ret <= 0) {
@@ -618,7 +642,7 @@ class PosixWritableFile final : public WritableFile {
 #endif  // HAVE_FDATASYNC
   }
   static Status AsyncSyncFd(int fd, const std::string& fd_path,
-                            struct io_uring* ring) {
+                            struct io_uring* ring, int async_writes) {
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
     sqe = io_uring_get_sqe(ring);
@@ -632,7 +656,7 @@ class PosixWritableFile final : public WritableFile {
     if (ret <= 0) {
       printf("Submition failed of fsync !\n");
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < async_writes + 1; i++) {
       int ret_cqe = io_uring_wait_cqe(ring, &cqe);
       if (ret_cqe) {
         fprintf(stderr, "wait_cqe %d\n", ret);
@@ -684,6 +708,7 @@ class PosixWritableFile final : public WritableFile {
   // buf_[0, pos_ - 1] contains data to be written to fd_.
   char buf_[kWritableFileBufferSize];
   size_t pos_;
+  int async_writes;
   int fd_;
 
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
