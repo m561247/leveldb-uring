@@ -15,7 +15,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <liburing.h>
 #include <limits>
 #include <queue>
 #include <set>
@@ -27,6 +26,7 @@
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
+#include <liburing.h>
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
@@ -63,6 +63,25 @@ constexpr const int kOpenBaseFlags = 0;
 
 // constexpr const size_t kWritableFileBufferSize = 65536;
 constexpr const size_t kWritableFileBufferSize = 8 * 1024 * 1024;
+
+struct ThreadInfo
+{
+  bool compaction_thd;
+  struct io_uring ring;
+  ThreadInfo() {
+    compaction_thd = false;
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
+      printf("Failed to initialize io_uring\n");
+    }
+  }
+  ~ThreadInfo() {
+    io_uring_queue_exit(&ring);
+  }
+};
+
+
+thread_local ThreadInfo tinfo;
 
 Status PosixError(const std::string& context, int error_number) {
   if (error_number == ENOENT) {
@@ -384,18 +403,18 @@ class PosixWritableFile final : public WritableFile {
         filename_(std::move(filename)),
         dirname_(Dirname(filename_)),
         async_writes(0) {
-    memset(&params, 0, sizeof(params));
-    // params.flags |= IORING_SETUP_SQPOLL;
-    // params.flags |= IORING_SETUP_SQE128;
-    // params.sq_thread_idle = 20000;
-    // int ret = io_uring_queue_init_params(2, &ring, &params);
+    // memset(&params, 0, sizeof(params));
+    // // params.flags |= IORING_SETUP_SQPOLL;
+    // // params.flags |= IORING_SETUP_SQE128;
+    // // params.sq_thread_idle = 20000;
+    // // int ret = io_uring_queue_init_params(2, &ring, &params);
 
-    int ret = io_uring_queue_init(8, &ring, 0);
-    if (ret < 0) {
-      // Handle initialization failure
-      // You might want to throw an exception or set an error flag
-      printf("Failed to initialize io_uring");
-    }
+    // int ret = io_uring_queue_init(8, &ring, 0);
+    // if (ret < 0) {
+    //   // Handle initialization failure
+    //   // You might want to throw an exception or set an error flag
+    //   printf("Failed to initialize io_uring");
+    // }
   }
 
   ~PosixWritableFile() override {
@@ -403,7 +422,6 @@ class PosixWritableFile final : public WritableFile {
       // Ignoring any potential errors
       Close();
     }
-    io_uring_queue_exit(&ring);
   }
 
   Status Append(const Slice& data) override {
@@ -469,7 +487,7 @@ class PosixWritableFile final : public WritableFile {
       return status;
     }
 
-    return SyncFd(fd_, filename_, &ring);
+    return SyncFd(fd_, filename_, &tinfo.ring);
   }
 
   Status AsyncSync() override {
@@ -478,7 +496,7 @@ class PosixWritableFile final : public WritableFile {
     if (!status.ok()) {
       return status;
     }
-    status = AsyncSyncFd(fd_, filename_, &ring, async_writes);
+    status = AsyncSyncFd(fd_, filename_, &tinfo.ring, async_writes);
     async_writes = 0;
     return status;
   }
@@ -506,13 +524,13 @@ class PosixWritableFile final : public WritableFile {
   Status WaitAsync(int async_writes) {
     struct io_uring_cqe* cqe;
     for (int i = 0; i < async_writes; i++) {
-      int ret_cqe = io_uring_wait_cqe(&ring, &cqe);
+      int ret_cqe = io_uring_wait_cqe(&tinfo.ring, &cqe);
       if (ret_cqe) {
         fprintf(stderr, "wait_cqe %d\n", ret_cqe);
         return PosixError("wait_cqe", errno);
       }
 
-      io_uring_cqe_seen(&ring, cqe);
+      io_uring_cqe_seen(&tinfo.ring, cqe);
     }
     return Status::OK();
   }
@@ -525,17 +543,17 @@ class PosixWritableFile final : public WritableFile {
     struct io_uring_cqe* cqe;
     int ret;
     // ret = io_uring_register_files(ring, fd_, 1);
-    sqe = io_uring_get_sqe(&ring);
+    sqe = io_uring_get_sqe(&tinfo.ring);
     // sqe->flags |= IOSQE_ASYNC;
     // sqe->flags |= IOSQE_FIXED_FILE;
 
     if (!sqe) {
-      io_uring_queue_exit(&ring);
+      io_uring_queue_exit(&tinfo.ring);
       return PosixError("Failed to get submission queue entry", errno);
     }
     // io_uring_prep_writev(sqe, fd_, &iov, 1, -1);
     io_uring_prep_write(sqe, fd_, (void*)data, size, -1);
-    ret = io_uring_submit(&ring);
+    ret = io_uring_submit(&tinfo.ring);
     // print_sq_poll_kernel_thread_status();
     if (ret <= 0) {
       printf("Submition failed of write !\n");
@@ -578,7 +596,7 @@ class PosixWritableFile final : public WritableFile {
     if (fd < 0) {
       status = PosixError(dirname_, errno);
     } else {
-      status = SyncFd(fd, dirname_, &ring);
+      status = SyncFd(fd, dirname_, &tinfo.ring);
       ::close(fd);
     }
     return status;
@@ -617,25 +635,25 @@ class PosixWritableFile final : public WritableFile {
 #else   // io_uring
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
-    sqe = io_uring_get_sqe(ring);
+    sqe = io_uring_get_sqe(&tinfo.ring);
     if (!sqe) {
       return PosixError("Failed to get SQE", errno);
     }
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
     io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
-    int ret = io_uring_submit(ring);
+    int ret = io_uring_submit(&tinfo.ring);
     if (ret <= 0) {
       printf("Submition failed of fsync !\n");
     }
     for (int i = 0; i < ret; i++) {
-      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      int ret_cqe = io_uring_wait_cqe(&tinfo.ring, &cqe);
       if (ret_cqe) {
         fprintf(stderr, "wait_cqe %d\n", ret);
         return PosixError("wait_cqe", errno);
       }
 
-      io_uring_cqe_seen(ring, cqe);
+      io_uring_cqe_seen(&tinfo.ring, cqe);
     }
     // io_uring_cq_advance(ring, 2);
     return Status::OK();
@@ -645,25 +663,25 @@ class PosixWritableFile final : public WritableFile {
                             struct io_uring* ring, int async_writes) {
     struct io_uring_sqe* sqe;
     struct io_uring_cqe* cqe;
-    sqe = io_uring_get_sqe(ring);
+    sqe = io_uring_get_sqe(&tinfo.ring);
     if (!sqe) {
       return PosixError("Failed to get SQE", errno);
     }
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
 
     io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
-    int ret = io_uring_submit(ring);
+    int ret = io_uring_submit(&tinfo.ring);
     if (ret <= 0) {
       printf("Submition failed of fsync !\n");
     }
     for (int i = 0; i < async_writes + 1; i++) {
-      int ret_cqe = io_uring_wait_cqe(ring, &cqe);
+      int ret_cqe = io_uring_wait_cqe(&tinfo.ring, &cqe);
       if (ret_cqe) {
         fprintf(stderr, "wait_cqe %d\n", ret);
         return PosixError("wait_cqe", errno);
       }
 
-      io_uring_cqe_seen(ring, cqe);
+      io_uring_cqe_seen(&tinfo.ring, cqe);
     }
     // io_uring_cq_advance(ring, 2);
     return Status::OK();
@@ -714,8 +732,6 @@ class PosixWritableFile final : public WritableFile {
   const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
-  struct io_uring ring;
-  struct io_uring_params params;
 };
 
 int LockOrUnlock(int fd, bool lock) {

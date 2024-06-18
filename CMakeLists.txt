@@ -269,7 +269,7 @@ if(HAVE_CLANG_THREAD_SAFETY)
 endif(HAVE_CLANG_THREAD_SAFETY)
 # io_uring
 # target_link_libraries(leveldb uring)
- target_link_libraries(leveldb /home/wys/liburing/src/liburing.a)
+ target_link_libraries(leveldb /home/e/liburing/src/liburing.a)
 
 if(HAVE_CRC32C)
   target_link_libraries(leveldb crc32c)
